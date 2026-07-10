@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -87,6 +88,9 @@ query:
   page_size: 50
 actions: []
 ";
+
+const AGENTS_SECTION_START: &str = "<!-- omniapp:agents:start -->";
+const AGENTS_SECTION_END: &str = "<!-- omniapp:agents:end -->";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -282,6 +286,7 @@ fn initialize(path: &Path, requested_name: Option<&str>, json: bool) -> Result<(
         metadata.join("scripts/README.md"),
         "# Project scripts\n\nExecutable project automation will live here. Scripts should use the OmniApp API instead of editing record files directly.\n",
     )?;
+    update_agents_file(path, name)?;
     update_gitignore(path)?;
     if json {
         println!(
@@ -296,6 +301,65 @@ fn initialize(path: &Path, requested_name: Option<&str>, json: bool) -> Result<(
         println!("Initialized OmniApp project in {}", path.display());
         println!("Next: omniapp validate {}", path.display());
     }
+    Ok(())
+}
+
+fn update_agents_file(root: &Path, project_name: &str) -> Result<()> {
+    let path = root.join("AGENTS.md");
+    let mut contents = if path.exists() {
+        fs::read_to_string(&path)?
+    } else {
+        String::new()
+    };
+    if contents.contains(AGENTS_SECTION_START) {
+        return Ok(());
+    }
+    if !contents.is_empty() && !contents.ends_with('\n') {
+        contents.push('\n');
+    }
+    if !contents.is_empty() {
+        contents.push('\n');
+    }
+    write!(
+        contents,
+        r"{AGENTS_SECTION_START}
+# OmniApp project instructions
+
+This directory is the **{project_name}** OmniApp project. It is agent-first: prefer the `omniapp` CLI for record operations so schema validation, relationships, indexing, and path moves remain consistent.
+
+## Filesystem contract
+
+- The filesystem is canonical. Git should track model definitions and project content.
+- `.omniapp/config.yml` contains project configuration.
+- `.omniapp/models/*.yml` defines record storage, fields, validation, and relationships.
+- `.omniapp/views/*.yml` defines saved queries and presentation.
+- `.omniapp/scripts/` is reserved for project automation.
+- `.omniapp/cache.sqlite3*` is generated and disposable; never edit or commit it.
+- Content outside `.omniapp/` is project data. Models determine whether each record is a directory or a single Markdown file.
+
+## CLI workflow
+
+Run commands from this project root:
+
+```sh
+omniapp validate
+omniapp list <Model>
+omniapp get <Model> <id-or-slug>
+omniapp create <Model> --set field=value
+omniapp update <Model> <id-or-slug> --set field=value
+omniapp delete <Model> <id-or-slug>
+omniapp query <view>
+omniapp search <query>
+omniapp serve
+```
+
+Add `--json` to any command when structured output is more useful. For larger writes, use `--input file.json` or pipe JSON to `--input -`.
+
+Direct file edits are allowed and expected in a local-first project, especially for Markdown and large assets. After direct edits, run `omniapp validate`. Do not write to the SQLite cache or assume it is authoritative.
+{AGENTS_SECTION_END}
+"
+    )?;
+    fs::write(path, contents)?;
     Ok(())
 }
 
@@ -406,6 +470,9 @@ mod tests {
         let ignore = fs::read_to_string(directory.path().join(".gitignore")).unwrap();
         assert!(ignore.starts_with("dist/\n"));
         assert!(ignore.contains(".omniapp/cache.sqlite3\n"));
+        let agents = fs::read_to_string(directory.path().join("AGENTS.md")).unwrap();
+        assert!(agents.contains("Test Library"));
+        assert!(agents.contains("omniapp validate"));
     }
 
     #[test]
@@ -413,5 +480,15 @@ mod tests {
         let directory = tempdir().unwrap();
         initialize(directory.path(), None, false).unwrap();
         assert!(initialize(directory.path(), None, false).is_err());
+    }
+
+    #[test]
+    fn initialization_preserves_existing_agent_instructions() {
+        let directory = tempdir().unwrap();
+        fs::write(directory.path().join("AGENTS.md"), "# Existing rules\n").unwrap();
+        initialize(directory.path(), Some("Test"), false).unwrap();
+        let agents = fs::read_to_string(directory.path().join("AGENTS.md")).unwrap();
+        assert!(agents.starts_with("# Existing rules\n"));
+        assert_eq!(agents.matches(AGENTS_SECTION_START).count(), 1);
     }
 }

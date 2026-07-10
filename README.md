@@ -22,6 +22,8 @@ cargo run -p omniapp-cli -- validate ./my-project
 cargo run -p omniapp-cli -- serve ./my-project
 ```
 
+Initialization also creates a root `AGENTS.md` with the project structure, filesystem rules, and CLI workflow so coding agents can work safely without prior OmniApp context. Existing agent instructions are preserved and the OmniApp section is appended once.
+
 `serve` starts at `127.0.0.1:7777`, increments until it finds a free port, rebuilds the cache, and opens the default browser. Pass `--no-open` for headless use.
 
 ## CLI record access
