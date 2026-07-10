@@ -6,6 +6,8 @@ use clap::{Parser, Subcommand};
 use omniapp_core::Workspace;
 use tracing_subscriber::EnvFilter;
 
+mod commands;
+
 const DEFAULT_MODEL: &str = r#"# Model fields may be stored in a path, a shared YAML file, Markdown, or an asset.
 version: 1
 name: Book
@@ -92,6 +94,9 @@ actions: []
     about = "A local-first platform for structured data"
 )]
 struct Cli {
+    /// Emit machine-readable JSON instead of human-readable output.
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -111,9 +116,6 @@ enum Command {
     Validate {
         #[arg(default_value = ".")]
         path: PathBuf,
-        /// Emit the complete validation report as JSON.
-        #[arg(long)]
-        json: bool,
     },
     /// Start the local web application.
     Serve {
@@ -126,6 +128,74 @@ enum Command {
         #[arg(long)]
         no_open: bool,
     },
+    /// List records for a model.
+    List {
+        model: String,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        #[arg(long, default_value_t = 1)]
+        page: usize,
+        #[arg(long, default_value_t = 50)]
+        page_size: usize,
+    },
+    /// Get one record by key, path, id, or slug.
+    Get {
+        model: String,
+        key: String,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Create a record.
+    Create {
+        model: String,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Set a field. JSON values are decoded; other values are strings.
+        #[arg(long = "set", value_name = "FIELD=VALUE")]
+        sets: Vec<String>,
+        /// Read a JSON object from a file, or use `-` for stdin.
+        #[arg(long, short)]
+        input: Option<PathBuf>,
+    },
+    /// Update an existing record.
+    Update {
+        model: String,
+        key: String,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Set a field. Use `null` to remove an optional value.
+        #[arg(long = "set", value_name = "FIELD=VALUE")]
+        sets: Vec<String>,
+        /// Read a JSON object from a file, or use `-` for stdin.
+        #[arg(long, short)]
+        input: Option<PathBuf>,
+    },
+    /// Delete a record after checking references and nested records.
+    Delete {
+        model: String,
+        key: String,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Run a saved declarative view query.
+    Query {
+        view: String,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        #[arg(long, default_value_t = 1)]
+        page: usize,
+        /// Override the view's configured page size.
+        #[arg(long)]
+        page_size: Option<usize>,
+    },
+    /// Search all indexed text fields using SQLite FTS5 syntax.
+    Search {
+        query: String,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
 }
 
 #[tokio::main]
@@ -137,18 +207,47 @@ async fn main() -> Result<()> {
         .with_target(false)
         .compact()
         .init();
-    match Cli::parse().command {
-        Command::Init { path, name } => initialize(&path, name.as_deref()),
-        Command::Validate { path, json } => validate(&path, json),
+    let cli = Cli::parse();
+    match cli.command {
+        Command::Init { path, name } => initialize(&path, name.as_deref(), cli.json),
+        Command::Validate { path } => validate(&path, cli.json),
         Command::Serve {
             path,
             port,
             no_open,
-        } => serve(path, port, no_open).await,
+        } => serve(path, port, no_open, cli.json).await,
+        Command::List {
+            model,
+            path,
+            page,
+            page_size,
+        } => commands::list(&path, &model, page, page_size, cli.json),
+        Command::Get { model, key, path } => commands::get(&path, &model, &key, cli.json),
+        Command::Create {
+            model,
+            path,
+            sets,
+            input,
+        } => commands::create(&path, &model, &sets, input.as_deref(), cli.json),
+        Command::Update {
+            model,
+            key,
+            path,
+            sets,
+            input,
+        } => commands::update(&path, &model, &key, &sets, input.as_deref(), cli.json),
+        Command::Delete { model, key, path } => commands::delete(&path, &model, &key, cli.json),
+        Command::Query {
+            view,
+            path,
+            page,
+            page_size,
+        } => commands::query(&path, &view, page, page_size, cli.json),
+        Command::Search { query, path, limit } => commands::search(&path, &query, limit, cli.json),
     }
 }
 
-fn initialize(path: &Path, requested_name: Option<&str>) -> Result<()> {
+fn initialize(path: &Path, requested_name: Option<&str>, json: bool) -> Result<()> {
     fs::create_dir_all(path).with_context(|| format!("could not create {}", path.display()))?;
     let metadata = path.join(".omniapp");
     if metadata.exists() {
@@ -183,8 +282,19 @@ fn initialize(path: &Path, requested_name: Option<&str>) -> Result<()> {
         "# Project scripts\n\nExecutable project automation will live here. Scripts should use the OmniApp API instead of editing record files directly.\n",
     )?;
     update_gitignore(path)?;
-    println!("Initialized OmniApp project in {}", path.display());
-    println!("Next: omniapp validate {}", path.display());
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "initialized": true,
+                "name": name,
+                "path": path,
+            }))?
+        );
+    } else {
+        println!("Initialized OmniApp project in {}", path.display());
+        println!("Next: omniapp validate {}", path.display());
+    }
     Ok(())
 }
 
@@ -241,7 +351,7 @@ fn validate(path: &Path, json: bool) -> Result<()> {
     Ok(())
 }
 
-async fn serve(path: PathBuf, port: u16, no_open: bool) -> Result<()> {
+async fn serve(path: PathBuf, port: u16, no_open: bool, json: bool) -> Result<()> {
     let workspace = Workspace::new(path);
     let report = workspace.validate()?;
     if !report.is_valid() {
@@ -257,7 +367,17 @@ async fn serve(path: PathBuf, port: u16, no_open: bool) -> Result<()> {
     let listener = omniapp_web::bind_available(port).await?;
     let address = listener.local_addr()?;
     let url = format!("http://{address}");
-    println!("OmniApp is running at {url} ({indexed} record(s) indexed)");
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "url": url,
+                "indexed": indexed,
+            }))?
+        );
+    } else {
+        println!("OmniApp is running at {url} ({indexed} record(s) indexed)");
+    }
     if !no_open && let Err(error) = open::that(&url) {
         eprintln!("Could not open the default browser: {error}");
     }
@@ -275,7 +395,7 @@ mod tests {
     fn initialized_project_is_valid_and_gitignore_is_preserved() {
         let directory = tempdir().unwrap();
         fs::write(directory.path().join(".gitignore"), "dist/\n").unwrap();
-        initialize(directory.path(), Some("Test Library")).unwrap();
+        initialize(directory.path(), Some("Test Library"), false).unwrap();
 
         let report = Workspace::new(directory.path()).validate().unwrap();
         assert!(report.is_valid());
@@ -290,7 +410,7 @@ mod tests {
     #[test]
     fn initialization_refuses_to_overwrite_metadata() {
         let directory = tempdir().unwrap();
-        initialize(directory.path(), None).unwrap();
-        assert!(initialize(directory.path(), None).is_err());
+        initialize(directory.path(), None, false).unwrap();
+        assert!(initialize(directory.path(), None, false).is_err());
     }
 }

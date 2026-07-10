@@ -11,7 +11,7 @@ This repository contains the first working vertical slice of the architecture:
 - atomic filesystem CRUD and safe relationship-aware deletion;
 - rebuildable SQLite FTS5 search cache and an embedding-ready cache table;
 - a local-only HTTP API and schema-generated table/form interface;
-- `init`, `validate`, and `serve` CLI commands.
+- complete CLI record access with human-readable and JSON output.
 
 ## Quick start
 
@@ -22,6 +22,46 @@ cargo run -p omniapp-cli -- serve ./my-project
 ```
 
 `serve` starts at `127.0.0.1:7777`, increments until it finds a free port, rebuilds the cache, and opens the default browser. Pass `--no-open` for headless use.
+
+## CLI record access
+
+All record commands operate directly on project files and do not require `omniapp serve`:
+
+```sh
+cd my-project
+
+omniapp list Book
+omniapp get Book dune
+omniapp create Book \
+  --set slug=dune \
+  --set title=Dune \
+  --set 'author=Frank Herbert'
+omniapp update Book dune --set status=complete
+omniapp query library --page 1
+omniapp search 'desert OR ecology'
+omniapp delete Book dune
+```
+
+Selectors accept the canonical record key/path or a unique `id` or `slug`. `--set` decodes valid JSON values, so booleans, numbers, arrays, objects, and `null` retain their types; other input is treated as a string. Quote a numeric-looking string as JSON, for example `--set 'title="1984"'`. On update, `null` removes an optional field.
+
+Every command accepts `--json` before or after the subcommand. List and query output includes pagination metadata:
+
+```sh
+omniapp list Book --json | jq '.records[].values.title'
+omniapp get Book dune --json
+omniapp search ecology --json
+```
+
+Create and update also accept a plain JSON object from a file or stdin. Repeatable `--set` values override fields supplied by `--input`:
+
+```sh
+omniapp create Book --input book.json --json
+
+printf '%s' '{"slug":"dune","title":"Dune"}' \
+  | omniapp create Book --input - --json
+```
+
+When operating outside the project directory, append its path after the command arguments, such as `omniapp list Book /path/to/project`.
 
 ## Repository layout
 
@@ -47,4 +87,3 @@ cargo test --workspace
 ```
 
 The cache and its WAL sidecars belong in `.gitignore`. Delete `.omniapp/cache.sqlite3*` at any time; `omniapp serve` recreates it from project files.
-

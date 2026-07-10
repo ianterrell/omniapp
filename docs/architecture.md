@@ -59,7 +59,8 @@ The server rereads records for requests. Search rebuilds before querying so edit
 
 ### Phase 3: initial product surfaces — implemented
 
-- `omniapp init`, `validate`, and `serve`.
+- `omniapp init`, `validate`, `serve`, `list`, `get`, `create`, `update`, `delete`, `query`, and `search`.
+- Human-readable terminal output and stable JSON-shaped output for automation.
 - Port probing from 7777 and automatic browser opening.
 - Project/model/view/record/search HTTP endpoints.
 - Schema-driven table display and generated create/edit/delete forms.
@@ -91,4 +92,3 @@ Models can name output path templates under `outputs`. For example, `publication
 - Deletion is rejected when another record references the target or a nested model record would be removed.
 
 Multi-file updates are not yet a single crash-safe transaction. The longer-term design is a small filesystem journal under `.omniapp/transactions/` containing intended renames and hashes, recoverable on workspace load.
-

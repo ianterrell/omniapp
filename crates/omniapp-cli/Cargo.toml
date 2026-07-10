@@ -13,8 +13,10 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 omniapp-core = { path = "../omniapp-core" }
+omniapp-schema = { path = "../omniapp-schema" }
 omniapp-web = { path = "../omniapp-web" }
 open.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -25,4 +27,3 @@ tempfile.workspace = true
 
 [lints]
 workspace = true
-
