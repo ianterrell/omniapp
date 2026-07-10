@@ -48,10 +48,26 @@ pub struct Model {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Storage {
-    /// A project-relative directory template, e.g. `books/{book}/scenes/{slug}`.
-    pub path: String,
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Storage {
+    /// Each record is a directory containing one or more configured files.
+    Directory { path: String },
+    /// Each record is one Markdown file whose fields live in its body/frontmatter.
+    File { path: String },
+}
+
+impl Storage {
+    #[must_use]
+    pub fn path(&self) -> &str {
+        match self {
+            Self::Directory { path } | Self::File { path } => path,
+        }
+    }
+
+    #[must_use]
+    pub fn is_file(&self) -> bool {
+        matches!(self, Self::File { .. })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,12 +109,23 @@ pub enum FieldType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum FieldSource {
-    /// The value is one segment captured from the model storage path.
+    /// The value is captured from a placeholder in the model storage path.
     Path { variable: String },
     /// The value is a key in a YAML mapping, shared by any number of fields.
     Yaml { file: String, key: String },
-    /// The entire file contents are the field value.
-    Markdown { file: String },
+    /// The Markdown body after optional YAML frontmatter.
+    Markdown {
+        /// Required for directory records; omitted for single-file records.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file: Option<String>,
+    },
+    /// A key in the YAML frontmatter of a Markdown document.
+    Frontmatter {
+        /// Required for directory records; omitted for single-file records.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file: Option<String>,
+        key: String,
+    },
     /// The field value is the project-relative path to a file in the record directory.
     Asset { file: String },
 }
@@ -292,13 +319,26 @@ pub fn validate_model(model: &Model) -> Vec<Problem> {
     if model.name.trim().is_empty() {
         problems.push(Problem::new(&location, "name must not be empty"));
     }
-    if model.storage.path.starts_with('/') || model.storage.path.contains("..") {
+    let storage_path = model.storage.path();
+    if storage_path.starts_with('/') || storage_path.split('/').any(|part| part == "..") {
         problems.push(Problem::new(
             format!("{location}.storage.path"),
             "must be a safe project-relative path",
         ));
     }
-    let placeholders = path_placeholders(&model.storage.path);
+    if storage_path.split('/').next() == Some(".omniapp") {
+        problems.push(Problem::new(
+            format!("{location}.storage.path"),
+            "record storage must live outside .omniapp",
+        ));
+    }
+    if !valid_path_template(storage_path) {
+        problems.push(Problem::new(
+            format!("{location}.storage.path"),
+            "contains malformed or ambiguous placeholders",
+        ));
+    }
+    let placeholders = path_placeholders(storage_path);
     for placeholder in &placeholders {
         match model.fields.get(placeholder) {
             Some(Field {
@@ -320,9 +360,7 @@ pub fn validate_model(model: &Model) -> Vec<Problem> {
                     format!("path variable {variable:?} is not in storage.path"),
                 ));
             }
-            FieldSource::Yaml { file, .. }
-            | FieldSource::Markdown { file }
-            | FieldSource::Asset { file }
+            FieldSource::Yaml { file, .. } | FieldSource::Asset { file }
                 if !is_safe_relative(file) =>
             {
                 problems.push(Problem::new(
@@ -330,7 +368,37 @@ pub fn validate_model(model: &Model) -> Vec<Problem> {
                     "source file must be a safe record-relative path",
                 ));
             }
+            FieldSource::Markdown { file } | FieldSource::Frontmatter { file, .. } => {
+                match (&model.storage, file) {
+                    (Storage::Directory { .. }, Some(file)) if !is_safe_relative(file) => {
+                        problems.push(Problem::new(
+                            &field_location,
+                            "source file must be a safe record-relative path",
+                        ));
+                    }
+                    (Storage::Directory { .. }, None) => problems.push(Problem::new(
+                        &field_location,
+                        "directory records require source.file",
+                    )),
+                    (Storage::File { .. }, Some(_)) => problems.push(Problem::new(
+                        &field_location,
+                        "single-file records must omit source.file",
+                    )),
+                    _ => {}
+                }
+            }
             _ => {}
+        }
+        if model.storage.is_file()
+            && matches!(
+                &field.source,
+                FieldSource::Yaml { .. } | FieldSource::Asset { .. }
+            )
+        {
+            problems.push(Problem::new(
+                &field_location,
+                "single-file records support path, markdown, and frontmatter sources only",
+            ));
         }
         if field.field_type == FieldType::Reference && field.reference.is_none() {
             problems.push(Problem::new(
@@ -357,6 +425,45 @@ pub fn validate_model(model: &Model) -> Vec<Problem> {
                 &field_location,
                 format!("invalid validation pattern: {error}"),
             ));
+        }
+    }
+    if model.storage.is_file()
+        && !model.fields.values().any(|field| {
+            matches!(
+                &field.source,
+                FieldSource::Markdown { .. } | FieldSource::Frontmatter { .. }
+            )
+        })
+    {
+        problems.push(Problem::new(
+            format!("{location}.fields"),
+            "single-file records require at least one markdown or frontmatter field",
+        ));
+    }
+
+    let mut markdown_bodies = BTreeSet::new();
+    let mut document_keys = BTreeSet::new();
+    for (name, field) in &model.fields {
+        match &field.source {
+            FieldSource::Markdown { file } => {
+                let document = file.as_deref().unwrap_or("<record-file>");
+                if !markdown_bodies.insert(document.to_owned()) {
+                    problems.push(Problem::new(
+                        format!("{location}.fields.{name}"),
+                        format!("document {document:?} already has a markdown body field"),
+                    ));
+                }
+            }
+            FieldSource::Frontmatter { file, key } => {
+                let document = file.as_deref().unwrap_or("<record-file>");
+                if !document_keys.insert((document.to_owned(), key.clone())) {
+                    problems.push(Problem::new(
+                        format!("{location}.fields.{name}"),
+                        format!("frontmatter key {key:?} is configured more than once"),
+                    ));
+                }
+            }
+            FieldSource::Path { .. } | FieldSource::Yaml { .. } | FieldSource::Asset { .. } => {}
         }
     }
     for (name, path) in &model.outputs {
@@ -432,15 +539,65 @@ pub fn validate_view(view: &View, models: &BTreeMap<String, Model>) -> Vec<Probl
 
 #[must_use]
 pub fn path_placeholders(template: &str) -> BTreeSet<String> {
-    template
-        .split('/')
-        .filter_map(|part| {
-            part.strip_prefix('{')
-                .and_then(|value| value.strip_suffix('}'))
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned)
-        })
-        .collect()
+    let mut placeholders = BTreeSet::new();
+    let mut remaining = template;
+    while let Some(start) = remaining.find('{') {
+        let after_start = &remaining[start + 1..];
+        let Some(end) = after_start.find('}') else {
+            break;
+        };
+        let variable = &after_start[..end];
+        if !variable.is_empty() {
+            placeholders.insert(variable.to_owned());
+        }
+        remaining = &after_start[end + 1..];
+    }
+    placeholders
+}
+
+#[must_use]
+pub fn valid_path_template(template: &str) -> bool {
+    if !is_safe_relative(template) {
+        return false;
+    }
+    for segment in template.split('/') {
+        let mut index = 0;
+        let mut previous_was_placeholder = false;
+        let mut placeholders = 0;
+        while index < segment.len() {
+            let remaining = &segment[index..];
+            if remaining.starts_with('}') {
+                return false;
+            }
+            if let Some(after_start) = remaining.strip_prefix('{') {
+                if previous_was_placeholder {
+                    return false;
+                }
+                placeholders += 1;
+                if placeholders > 1 {
+                    return false;
+                }
+                let Some(end) = after_start.find('}') else {
+                    return false;
+                };
+                let variable = &after_start[..end];
+                if variable.is_empty()
+                    || !variable
+                        .chars()
+                        .all(|character| character.is_ascii_alphanumeric() || character == '_')
+                {
+                    return false;
+                }
+                index += end + 2;
+                previous_was_placeholder = true;
+            } else {
+                let length = remaining.chars().next().map_or(1, char::len_utf8);
+                index += length;
+                previous_was_placeholder = false;
+            }
+        }
+    }
+    true
 }
 
 #[must_use]
@@ -460,6 +617,16 @@ mod tests {
             path_placeholders("books/{book}/scenes/{slug}"),
             BTreeSet::from(["book".to_owned(), "slug".to_owned()])
         );
+    }
+
+    #[test]
+    fn extracts_placeholders_embedded_in_file_names() {
+        assert_eq!(
+            path_placeholders("posts/published-{slug}.md"),
+            BTreeSet::from(["slug".to_owned()])
+        );
+        assert!(valid_path_template("posts/published-{slug}.md"));
+        assert!(!valid_path_template("posts/{date}-{slug}.md"));
     }
 
     #[test]

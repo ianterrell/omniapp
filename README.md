@@ -4,7 +4,8 @@ OmniApp is a local-first platform for arbitrary structured data. A project is a 
 
 This repository contains the first working vertical slice of the architecture:
 
-- declarative models with path-templated, YAML, Markdown, and asset fields;
+- directory records with arbitrary configured YAML, Markdown, and asset filenames;
+- single-file Markdown records such as `posts/{slug}.md` with structured YAML frontmatter;
 - nested storage such as `books/{book}/scenes/{slug}`;
 - declarative views with filters, ordering, and pagination;
 - record/schema/reference validation;
@@ -77,6 +78,8 @@ docs/
 ```
 
 The current implementation deliberately does not execute project scripts yet, load `sqlite-vec`, or render specialized board/calendar/tree layouts. Their boundaries and sequencing are documented in [the architecture plan](docs/architecture.md).
+
+[`examples/markdown-records`](examples/markdown-records) is a working project showing both single-file Markdown records and directory records whose body/frontmatter document is named `content.md`.
 
 ## Development
 

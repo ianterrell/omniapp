@@ -16,12 +16,17 @@ Model and view files are loaded from `.omniapp/models/*.{yml,yaml}` and `.omniap
 
 ## Models
 
-Storage paths consist of literal directory segments and `{field}` segments. Every placeholder requires a field with a matching `path` source.
+Every model chooses either directory or single-file storage. Storage paths may contain one `{field}` placeholder per path segment. Placeholders may be embedded in a filename, such as `{slug}.md`, and each requires a matching `path` source.
+
+### Directory records
+
+A directory record can use any filenames declared by the model. There is no `index.md` or other naming convention:
 
 ```yaml
 version: 1
 name: Scene
 storage:
+  kind: directory
   path: books/{book}/scenes/{slug}
 fields:
   book:
@@ -48,18 +53,85 @@ outputs:
   rendered: build/{book}/scenes/{slug}.html
 ```
 
+Markdown bodies and YAML frontmatter can share any configured document:
+
+```yaml
+version: 1
+name: Article
+storage:
+  kind: directory
+  path: articles/{slug}
+fields:
+  slug:
+    type: string
+    required: true
+    source: { kind: path, variable: slug }
+  title:
+    type: string
+    required: true
+    source: { kind: frontmatter, file: manuscript.markdown, key: title }
+  tags:
+    type: json
+    source: { kind: frontmatter, file: manuscript.markdown, key: tags }
+  body:
+    type: text
+    source: { kind: markdown, file: manuscript.markdown }
+```
+
+This produces `articles/<slug>/manuscript.markdown`. Frontmatter fields and the body are parsed and written together atomically. Unknown frontmatter keys are retained.
+
+### Single-file records
+
+For a single-file record, the storage path is the Markdown document itself. Markdown and frontmatter sources omit `file` because they implicitly use that document:
+
+```yaml
+version: 1
+name: Post
+storage:
+  kind: file
+  path: posts/{slug}.md
+fields:
+  slug:
+    type: string
+    required: true
+    source: { kind: path, variable: slug }
+  title:
+    type: string
+    required: true
+    source: { kind: frontmatter, key: title }
+  published_on:
+    type: date
+    source: { kind: frontmatter, key: published_on }
+  body:
+    type: text
+    source: { kind: markdown }
+```
+
+The resulting file is ordinary Markdown:
+
+```markdown
+---
+title: A local-first post
+published_on: 2026-07-10
+---
+# The body
+```
+
+Single-file models intentionally support only `path`, `frontmatter`, and `markdown` sources. Data that needs several YAML, Markdown, or asset files should use directory storage.
+
 Supported field types are `string`, `text`, `integer`, `number`, `boolean`, `date`, `date_time`, `enum`, `reference`, `asset`, and `json`.
 
 Sources:
 
-- `path`: one directory segment captured from `storage.path`;
+- `path`: a value captured from a placeholder in `storage.path`;
 - `yaml`: a named key in a mapping; fields may share or use different YAML files;
-- `markdown`: the complete UTF-8 contents of one file;
+- `frontmatter`: a named key in a Markdown document's YAML frontmatter;
+- `markdown`: the UTF-8 Markdown body after any frontmatter;
 - `asset`: the project-relative path to a fixed-name file when that file exists.
 
 Validation supports `min`, `max`, `min_length`, `max_length`, `pattern`, and `choices`. Dates use `YYYY-MM-DD`; date-times use RFC 3339.
 
-Record identity is the string or integer `id` field when present, otherwise the record's project-relative directory. An explicit stable `id` is recommended when path fields are frequently renamed or other systems retain record URLs.
+Record identity is the string or integer `id` field when present, otherwise the project-relative record file or directory. An explicit stable `id` is recommended when path fields are frequently renamed or other systems retain record URLs.
 
 ## Views and queries
 
@@ -92,4 +164,3 @@ Recognized view types are `form`, `table`, `tree`, `board`, `calendar`, `gallery
 ## Cache
 
 `.omniapp/cache.sqlite3`, `-wal`, and `-shm` files are generated. They contain normalized JSON records, an FTS5 index, and a reserved rebuildable embeddings table. They must not be used for backup or committed to source control.
-

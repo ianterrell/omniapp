@@ -115,7 +115,7 @@
         await api(url,options);$('#editor').close();await load()
       }catch(err){alert(err.message)}
     }
-    async function removeRecord(){if(!confirm('Delete this record directory and everything inside it?'))return;try{await api(`/api/models/${encodeURIComponent(state.view.model)}/record?key=${encodeURIComponent(state.editing.key)}`,{method:'DELETE'});$('#editor').close();await load()}catch(e){alert(e.message)}}
+    async function removeRecord(){if(!confirm('Delete this record from disk?'))return;try{await api(`/api/models/${encodeURIComponent(state.view.model)}/record?key=${encodeURIComponent(state.editing.key)}`,{method:'DELETE'});$('#editor').close();await load()}catch(e){alert(e.message)}}
     function showError(message){$('#content').innerHTML=`<div class="error">${esc(message)}</div>`}
     $('#newButton').onclick=()=>openEditor();$('#filter').oninput=()=>state.result&&renderTable();$('.close').onclick=()=>$('#editor').close();boot();
   </script>

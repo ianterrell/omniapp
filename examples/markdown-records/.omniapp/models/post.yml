@@ -1,0 +1,27 @@
+version: 1
+name: Post
+label: Posts
+storage:
+  kind: file
+  path: posts/{slug}.md
+fields:
+  slug:
+    type: string
+    required: true
+    source: { kind: path, variable: slug }
+    validation: { pattern: "^[a-z0-9]+(?:-[a-z0-9]+)*$" }
+  title:
+    type: string
+    required: true
+    source: { kind: frontmatter, key: title }
+  status:
+    type: enum
+    default: draft
+    source: { kind: frontmatter, key: status }
+    validation: { choices: [draft, published] }
+  published_on:
+    type: date
+    source: { kind: frontmatter, key: published_on }
+  body:
+    type: text
+    source: { kind: markdown }

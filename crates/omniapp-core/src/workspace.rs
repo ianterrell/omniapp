@@ -4,8 +4,8 @@ use std::path::{Component, Path, PathBuf};
 
 use chrono::{DateTime, NaiveDate};
 use omniapp_schema::{
-    Field, FieldSource, FieldType, Model, Problem, ProjectConfig, View, read_yaml, validate_config,
-    validate_model, validate_view,
+    Field, FieldSource, FieldType, Model, Problem, ProjectConfig, Storage, View, read_yaml,
+    validate_config, validate_model, validate_view,
 };
 use regex::Regex;
 use serde::Serialize;
@@ -13,6 +13,7 @@ use serde_json::Value;
 use thiserror::Error;
 use walkdir::WalkDir;
 
+use crate::document::MarkdownDocument;
 use crate::{Cache, Record, RecordInput};
 
 #[derive(Debug, Error)]
@@ -115,9 +116,9 @@ impl Workspace {
     }
 
     pub fn records(&self, model: &Model) -> Result<Vec<Record>, WorkspaceError> {
-        discover_record_dirs(&self.root, &model.storage.path)
+        discover_record_locations(&self.root, &model.storage)
             .into_iter()
-            .map(|(directory, captures)| self.read_record(model, &directory, &captures))
+            .map(|(location, captures)| self.read_record(model, &location, &captures))
             .collect()
     }
 
@@ -284,11 +285,21 @@ impl Workspace {
                 target.display()
             )));
         }
-        fs::create_dir_all(&target).map_err(|source| io_error(&target, source))?;
+        match &model.storage {
+            Storage::Directory { .. } => {
+                fs::create_dir_all(&target).map_err(|source| io_error(&target, source))?;
+            }
+            Storage::File { .. } => {
+                let parent = target.parent().ok_or_else(|| {
+                    WorkspaceError::Invalid("record file has no parent directory".into())
+                })?;
+                fs::create_dir_all(parent).map_err(|source| io_error(parent, source))?;
+            }
+        }
         write_record_files(&target, model, &values)?;
 
         let captures =
-            match_storage_path(&model.storage.path, &target_relative).ok_or_else(|| {
+            match_storage_path(model.storage.path(), &target_relative).ok_or_else(|| {
                 WorkspaceError::Invalid("rendered storage path did not match model".into())
             })?;
         self.read_record(model, &target, &captures)
@@ -310,7 +321,10 @@ impl Workspace {
             })?;
         let all_records = self.all_records(&loaded)?;
         for candidate in &all_records {
-            if candidate.model != record.model && candidate.path.starts_with(&record.path) {
+            if matches!(&model.storage, Storage::Directory { .. })
+                && candidate.model != record.model
+                && candidate.path.starts_with(&record.path)
+            {
                 return Err(WorkspaceError::Invalid(format!(
                     "cannot delete {}; nested {} record {:?} exists at {}",
                     record.path.display(),
@@ -351,21 +365,27 @@ impl Workspace {
             }
         }
         let path = self.root.join(record.path);
-        fs::remove_dir_all(&path).map_err(|source| io_error(path, source))
+        match &model.storage {
+            Storage::Directory { .. } => {
+                fs::remove_dir_all(&path).map_err(|source| io_error(path, source))
+            }
+            Storage::File { .. } => fs::remove_file(&path).map_err(|source| io_error(path, source)),
+        }
     }
 
     fn read_record(
         &self,
         model: &Model,
-        directory: &Path,
+        location: &Path,
         captures: &BTreeMap<String, String>,
     ) -> Result<Record, WorkspaceError> {
-        let relative = directory
+        let relative = location
             .strip_prefix(&self.root)
             .map_err(|_| WorkspaceError::Invalid("record escaped project root".into()))?
             .to_path_buf();
         let mut values = BTreeMap::new();
-        let mut yaml_documents: HashMap<String, serde_yaml::Value> = HashMap::new();
+        let mut yaml_documents: HashMap<PathBuf, serde_yaml::Value> = HashMap::new();
+        let mut markdown_documents: HashMap<PathBuf, MarkdownDocument> = HashMap::new();
 
         for (name, field) in &model.fields {
             let value = match &field.source {
@@ -373,8 +393,8 @@ impl Workspace {
                     .get(variable)
                     .map(|value| Value::String(value.clone())),
                 FieldSource::Yaml { file, key } => {
-                    if !yaml_documents.contains_key(file) {
-                        let path = directory.join(file);
+                    let path = source_path(model, location, Some(file))?;
+                    if !yaml_documents.contains_key(&path) {
                         let document = if path.exists() {
                             let contents = fs::read_to_string(&path)
                                 .map_err(|source| io_error(&path, source))?;
@@ -387,28 +407,53 @@ impl Workspace {
                         } else {
                             serde_yaml::Value::Mapping(serde_yaml::Mapping::new())
                         };
-                        yaml_documents.insert(file.clone(), document);
+                        yaml_documents.insert(path.clone(), document);
                     }
                     yaml_documents
-                        .get(file)
+                        .get(&path)
                         .and_then(serde_yaml::Value::as_mapping)
                         .and_then(|mapping| mapping.get(serde_yaml::Value::String(key.clone())))
                         .map(|value| serde_json::to_value(value).unwrap_or(Value::Null))
                 }
                 FieldSource::Markdown { file } => {
-                    let path = directory.join(file);
-                    path.exists()
-                        .then(|| {
-                            fs::read_to_string(&path)
-                                .map(Value::String)
-                                .map_err(|source| io_error(&path, source))
+                    let path = source_path(model, location, file.as_deref())?;
+                    if !markdown_documents.contains_key(&path) {
+                        markdown_documents.insert(path.clone(), MarkdownDocument::read(&path)?);
+                    }
+                    path.exists().then(|| {
+                        Value::String(
+                            markdown_documents
+                                .get(&path)
+                                .expect("document was inserted")
+                                .body
+                                .clone(),
+                        )
+                    })
+                }
+                FieldSource::Frontmatter { file, key } => {
+                    let path = source_path(model, location, file.as_deref())?;
+                    if !markdown_documents.contains_key(&path) {
+                        markdown_documents.insert(path.clone(), MarkdownDocument::read(&path)?);
+                    }
+                    markdown_documents
+                        .get(&path)
+                        .and_then(|document| {
+                            document
+                                .frontmatter
+                                .get(serde_yaml::Value::String(key.clone()))
                         })
-                        .transpose()?
+                        .map(|value| serde_json::to_value(value).unwrap_or(Value::Null))
                 }
                 FieldSource::Asset { file } => {
-                    let path = directory.join(file);
-                    path.exists()
-                        .then(|| Value::String(relative.join(file).to_string_lossy().into_owned()))
+                    let path = source_path(model, location, Some(file))?;
+                    path.exists().then(|| {
+                        Value::String(
+                            path.strip_prefix(&self.root)
+                                .unwrap_or(&path)
+                                .to_string_lossy()
+                                .into_owned(),
+                        )
+                    })
                 }
             };
             if let Some(value) = value.filter(|value| !value.is_null()) {
@@ -467,7 +512,11 @@ where
     Ok(values)
 }
 
-fn discover_record_dirs(root: &Path, template: &str) -> Vec<(PathBuf, BTreeMap<String, String>)> {
+fn discover_record_locations(
+    root: &Path,
+    storage: &Storage,
+) -> Vec<(PathBuf, BTreeMap<String, String>)> {
+    let template = storage.path();
     let depth = template.split('/').count();
     let mut matches = WalkDir::new(root)
         .follow_links(false)
@@ -475,7 +524,10 @@ fn discover_record_dirs(root: &Path, template: &str) -> Vec<(PathBuf, BTreeMap<S
         .max_depth(depth)
         .into_iter()
         .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_dir())
+        .filter(|entry| match storage {
+            Storage::Directory { .. } => entry.file_type().is_dir(),
+            Storage::File { .. } => entry.file_type().is_file(),
+        })
         .filter_map(|entry| {
             let relative = entry.path().strip_prefix(root).ok()?;
             match_storage_path(template, relative).map(|captures| (entry.into_path(), captures))
@@ -499,16 +551,42 @@ fn match_storage_path(template: &str, path: &Path) -> Option<BTreeMap<String, St
     }
     let mut captures = BTreeMap::new();
     for (expected, actual) in template_parts.into_iter().zip(path_parts) {
-        if let Some(variable) = expected
-            .strip_prefix('{')
-            .and_then(|value| value.strip_suffix('}'))
-        {
-            captures.insert(variable.to_owned(), actual.to_owned());
-        } else if expected != actual {
-            return None;
+        let (pattern, variables) = segment_pattern(expected)?;
+        let matched = pattern.captures(actual)?;
+        for (index, variable) in variables.iter().enumerate() {
+            let value = matched.get(index + 1)?.as_str().to_owned();
+            if let Some(previous) = captures.insert(variable.clone(), value.clone())
+                && previous != value
+            {
+                return None;
+            }
         }
     }
     Some(captures)
+}
+
+fn segment_pattern(template: &str) -> Option<(Regex, Vec<String>)> {
+    let mut pattern = String::from("^");
+    let mut variables = Vec::new();
+    let mut remaining = template;
+    while let Some(start) = remaining.find('{') {
+        pattern.push_str(&regex::escape(&remaining[..start]));
+        let after_start = &remaining[start + 1..];
+        let end = after_start.find('}')?;
+        let variable = &after_start[..end];
+        if variable.is_empty() {
+            return None;
+        }
+        variables.push(variable.to_owned());
+        pattern.push_str("(.+?)");
+        remaining = &after_start[end + 1..];
+    }
+    if remaining.contains('}') {
+        return None;
+    }
+    pattern.push_str(&regex::escape(remaining));
+    pattern.push('$');
+    Some((Regex::new(&pattern).ok()?, variables))
 }
 
 fn render_storage_path(
@@ -516,28 +594,46 @@ fn render_storage_path(
     values: &BTreeMap<String, Value>,
 ) -> Result<PathBuf, WorkspaceError> {
     let mut path = PathBuf::new();
-    for part in model.storage.path.split('/') {
-        if let Some(variable) = part
-            .strip_prefix('{')
-            .and_then(|value| value.strip_suffix('}'))
-        {
-            let value = values
-                .get(variable)
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    WorkspaceError::Invalid(format!("path field {variable:?} must be a string"))
-                })?;
-            if value.is_empty() || matches!(value, "." | "..") || value.contains(['/', '\\']) {
-                return Err(WorkspaceError::Invalid(format!(
-                    "path field {variable:?} must be one safe path segment"
-                )));
-            }
-            path.push(value);
-        } else {
-            path.push(part);
-        }
+    for part in model.storage.path().split('/') {
+        path.push(render_template_segment(part, values)?);
     }
     Ok(path)
+}
+
+fn render_template_segment(
+    template: &str,
+    values: &BTreeMap<String, Value>,
+) -> Result<String, WorkspaceError> {
+    let mut rendered = String::new();
+    let mut remaining = template;
+    while let Some(start) = remaining.find('{') {
+        rendered.push_str(&remaining[..start]);
+        let after_start = &remaining[start + 1..];
+        let end = after_start.find('}').ok_or_else(|| {
+            WorkspaceError::Invalid(format!("invalid path template segment {template:?}"))
+        })?;
+        let variable = &after_start[..end];
+        let value = values
+            .get(variable)
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                WorkspaceError::Invalid(format!("path field {variable:?} must be a string"))
+            })?;
+        if value.is_empty() || value.contains(['/', '\\']) {
+            return Err(WorkspaceError::Invalid(format!(
+                "path field {variable:?} must not be empty or contain path separators"
+            )));
+        }
+        rendered.push_str(value);
+        remaining = &after_start[end + 1..];
+    }
+    rendered.push_str(remaining);
+    if matches!(rendered.as_str(), "" | "." | "..") {
+        return Err(WorkspaceError::Invalid(format!(
+            "rendered path segment {rendered:?} is unsafe"
+        )));
+    }
+    Ok(rendered)
 }
 
 fn record_key(path: &Path, values: &BTreeMap<String, Value>) -> String {
@@ -552,32 +648,53 @@ fn record_key(path: &Path, values: &BTreeMap<String, Value>) -> String {
 }
 
 fn write_record_files(
-    directory: &Path,
+    location: &Path,
     model: &Model,
     values: &BTreeMap<String, Value>,
 ) -> Result<(), WorkspaceError> {
-    let mut yaml_files: BTreeMap<String, Vec<(&str, Option<&Value>)>> = BTreeMap::new();
+    #[derive(Default)]
+    enum BodyUpdate {
+        #[default]
+        Unchanged,
+        Remove,
+        Set(String),
+    }
+
+    #[derive(Default)]
+    struct DocumentUpdate {
+        body: BodyUpdate,
+        frontmatter: Vec<(String, Option<Value>)>,
+    }
+
+    let mut yaml_files: BTreeMap<PathBuf, Vec<(&str, Option<&Value>)>> = BTreeMap::new();
+    let mut markdown_files: BTreeMap<PathBuf, DocumentUpdate> = BTreeMap::new();
     for (name, field) in &model.fields {
         match &field.source {
             FieldSource::Yaml { file, key } => {
                 yaml_files
-                    .entry(file.clone())
+                    .entry(source_path(model, location, Some(file))?)
                     .or_default()
                     .push((key, values.get(name)));
             }
             FieldSource::Markdown { file } => {
-                let path = directory.join(file);
-                if let Some(Value::String(contents)) = values.get(name) {
-                    atomic_write(&path, contents.as_bytes())?;
-                } else if path.exists() {
-                    fs::remove_file(&path).map_err(|source| io_error(path, source))?;
-                }
+                let path = source_path(model, location, file.as_deref())?;
+                markdown_files.entry(path).or_default().body = values
+                    .get(name)
+                    .and_then(Value::as_str)
+                    .map_or(BodyUpdate::Remove, |body| BodyUpdate::Set(body.to_owned()));
+            }
+            FieldSource::Frontmatter { file, key } => {
+                let path = source_path(model, location, file.as_deref())?;
+                markdown_files
+                    .entry(path)
+                    .or_default()
+                    .frontmatter
+                    .push((key.clone(), values.get(name).cloned()));
             }
             FieldSource::Path { .. } | FieldSource::Asset { .. } => {}
         }
     }
-    for (file, fields) in yaml_files {
-        let path = directory.join(file);
+    for (path, fields) in yaml_files {
         let mut mapping = if path.exists() {
             let contents = fs::read_to_string(&path).map_err(|source| io_error(&path, source))?;
             serde_yaml::from_str::<serde_yaml::Value>(&contents)
@@ -611,7 +728,62 @@ fn write_record_files(
         })?;
         atomic_write(&path, contents.as_bytes())?;
     }
+    for (path, update) in markdown_files {
+        let mut document = MarkdownDocument::read(&path)?;
+        match update.body {
+            BodyUpdate::Unchanged => {}
+            BodyUpdate::Remove => document.body.clear(),
+            BodyUpdate::Set(body) => document.body = body,
+        }
+        let has_configured_frontmatter = !update.frontmatter.is_empty();
+        for (key, value) in update.frontmatter {
+            let yaml_key = serde_yaml::Value::String(key.clone());
+            if let Some(value) = value {
+                let yaml_value = serde_yaml::to_value(value).map_err(|error| {
+                    WorkspaceError::Invalid(format!("could not serialize {key}: {error}"))
+                })?;
+                document.frontmatter.insert(yaml_key, yaml_value);
+            } else {
+                document.frontmatter.remove(&yaml_key);
+            }
+        }
+        if matches!(&model.storage, Storage::Directory { .. })
+            && document.body.is_empty()
+            && document.frontmatter.is_empty()
+        {
+            if path.exists() {
+                fs::remove_file(&path).map_err(|source| io_error(path, source))?;
+            }
+        } else {
+            let contents = document.render(has_configured_frontmatter)?;
+            atomic_write(&path, contents.as_bytes())?;
+        }
+    }
     Ok(())
+}
+
+fn source_path(
+    model: &Model,
+    location: &Path,
+    configured_file: Option<&str>,
+) -> Result<PathBuf, WorkspaceError> {
+    match &model.storage {
+        Storage::Directory { .. } => {
+            configured_file
+                .map(|file| location.join(file))
+                .ok_or_else(|| {
+                    WorkspaceError::Invalid("directory record source is missing its file".into())
+                })
+        }
+        Storage::File { .. } => {
+            if configured_file.is_some() {
+                return Err(WorkspaceError::Invalid(
+                    "single-file record sources must not name another file".into(),
+                ));
+            }
+            Ok(location.to_path_buf())
+        }
+    }
 }
 
 fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), WorkspaceError> {
@@ -853,7 +1025,7 @@ mod tests {
             name: "Book".into(),
             label: None,
             description: None,
-            storage: Storage {
+            storage: Storage::Directory {
                 path: "books/{slug}".into(),
             },
             fields: BTreeMap::from([
@@ -884,7 +1056,7 @@ mod tests {
                         FieldType::Text,
                         false,
                         FieldSource::Markdown {
-                            file: "README.md".into(),
+                            file: Some("README.md".into()),
                         },
                     ),
                 ),
@@ -914,6 +1086,193 @@ mod tests {
             "# Dune\n"
         );
         assert!(workspace.validate().unwrap().is_valid());
+    }
+
+    #[test]
+    fn directory_record_uses_arbitrary_markdown_name_with_frontmatter() {
+        let directory = tempdir().unwrap();
+        let workspace = Workspace::new(directory.path());
+        let model = Model {
+            version: 1,
+            name: "Article".into(),
+            label: None,
+            description: None,
+            storage: Storage::Directory {
+                path: "articles/{slug}".into(),
+            },
+            fields: BTreeMap::from([
+                (
+                    "slug".into(),
+                    field(
+                        FieldType::String,
+                        true,
+                        FieldSource::Path {
+                            variable: "slug".into(),
+                        },
+                    ),
+                ),
+                (
+                    "title".into(),
+                    field(
+                        FieldType::String,
+                        true,
+                        FieldSource::Frontmatter {
+                            file: Some("manuscript.markdown".into()),
+                            key: "title".into(),
+                        },
+                    ),
+                ),
+                (
+                    "body".into(),
+                    field(
+                        FieldType::Text,
+                        false,
+                        FieldSource::Markdown {
+                            file: Some("manuscript.markdown".into()),
+                        },
+                    ),
+                ),
+            ]),
+            outputs: BTreeMap::new(),
+        };
+        write_test_project(directory.path(), &model);
+
+        let record = workspace
+            .save_record(
+                "Article",
+                None,
+                RecordInput {
+                    values: serde_json::from_value(
+                        json!({"slug":"local-first", "title":"Local First", "body":"# Draft\n"}),
+                    )
+                    .unwrap(),
+                },
+            )
+            .unwrap();
+        assert_eq!(record.values["body"], "# Draft\n");
+        let contents = fs::read_to_string(
+            directory
+                .path()
+                .join("articles/local-first/manuscript.markdown"),
+        )
+        .unwrap();
+        assert!(contents.starts_with("---\ntitle: Local First\n---\n"));
+        assert!(contents.ends_with("# Draft\n"));
+        assert!(workspace.validate().unwrap().is_valid());
+    }
+
+    #[test]
+    fn single_file_record_preserves_frontmatter_and_moves_with_path_fields() {
+        let directory = tempdir().unwrap();
+        let workspace = Workspace::new(directory.path());
+        let model = Model {
+            version: 1,
+            name: "Post".into(),
+            label: None,
+            description: None,
+            storage: Storage::File {
+                path: "posts/{slug}.md".into(),
+            },
+            fields: BTreeMap::from([
+                (
+                    "date".into(),
+                    field(
+                        FieldType::Date,
+                        true,
+                        FieldSource::Frontmatter {
+                            file: None,
+                            key: "date".into(),
+                        },
+                    ),
+                ),
+                (
+                    "slug".into(),
+                    field(
+                        FieldType::String,
+                        true,
+                        FieldSource::Path {
+                            variable: "slug".into(),
+                        },
+                    ),
+                ),
+                (
+                    "title".into(),
+                    field(
+                        FieldType::String,
+                        true,
+                        FieldSource::Frontmatter {
+                            file: None,
+                            key: "title".into(),
+                        },
+                    ),
+                ),
+                (
+                    "body".into(),
+                    field(FieldType::Text, false, FieldSource::Markdown { file: None }),
+                ),
+            ]),
+            outputs: BTreeMap::new(),
+        };
+        write_test_project(directory.path(), &model);
+        let created = workspace
+            .save_record(
+                "Post",
+                None,
+                RecordInput {
+                    values: serde_json::from_value(json!({
+                        "date":"2026-07-10",
+                        "slug":"hello",
+                        "title":"Hello",
+                        "body":"First draft.\n"
+                    }))
+                    .unwrap(),
+                },
+            )
+            .unwrap();
+        let original = directory.path().join("posts/hello.md");
+        let contents = fs::read_to_string(&original).unwrap();
+        fs::write(
+            &original,
+            contents.replace("title: Hello\n", "title: Hello\nexternal: keep-me\n"),
+        )
+        .unwrap();
+
+        let updated = workspace
+            .save_record(
+                "Post",
+                Some(&created.key),
+                RecordInput {
+                    values: serde_json::from_value(json!({
+                        "slug":"hello-world",
+                        "title":"Hello World"
+                    }))
+                    .unwrap(),
+                },
+            )
+            .unwrap();
+        let moved = directory.path().join("posts/hello-world.md");
+        assert!(!original.exists());
+        assert!(moved.exists());
+        let contents = fs::read_to_string(&moved).unwrap();
+        assert!(contents.contains("title: Hello World"));
+        assert!(contents.contains("external: keep-me"));
+        assert!(contents.ends_with("First draft.\n"));
+        assert_eq!(updated.values["slug"], "hello-world");
+        assert!(workspace.validate().unwrap().is_valid());
+
+        workspace.delete_record("Post", &updated.key).unwrap();
+        assert!(!moved.exists());
+    }
+
+    fn write_test_project(root: &Path, model: &Model) {
+        fs::create_dir_all(root.join(".omniapp/models")).unwrap();
+        fs::create_dir_all(root.join(".omniapp/views")).unwrap();
+        fs::write(root.join(".omniapp/config.yml"), "version: 1\nname: Test\n").unwrap();
+        fs::write(
+            root.join(".omniapp/models/model.yml"),
+            serde_yaml::to_string(model).unwrap(),
+        )
+        .unwrap();
     }
 
     fn field(field_type: FieldType, required: bool, source: FieldSource) -> Field {

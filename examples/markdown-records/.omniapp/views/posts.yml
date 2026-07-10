@@ -1,0 +1,11 @@
+version: 1
+name: posts
+label: Posts
+model: Post
+type: table
+fields: [title, status, published_on]
+query:
+  order:
+    - field: published_on
+      direction: desc
+  page_size: 25

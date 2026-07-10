@@ -1,6 +1,7 @@
 //! Filesystem-first services shared by the OmniApp CLI and web application.
 
 mod cache;
+mod document;
 mod query;
 mod record;
 mod workspace;

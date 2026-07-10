@@ -1,0 +1,21 @@
+version: 1
+name: Article
+label: Articles
+storage:
+  kind: directory
+  path: articles/{slug}
+fields:
+  slug:
+    type: string
+    required: true
+    source: { kind: path, variable: slug }
+  title:
+    type: string
+    required: true
+    source: { kind: frontmatter, file: content.md, key: title }
+  category:
+    type: string
+    source: { kind: frontmatter, file: content.md, key: category }
+  body:
+    type: text
+    source: { kind: markdown, file: content.md }

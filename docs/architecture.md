@@ -44,9 +44,10 @@ The server rereads records for requests. Search rebuilds before querying so edit
 - Cargo workspace and reusable crate separation.
 - Versioned, strict YAML project format.
 - Configurable path templates with nested record support.
-- Multiple YAML and Markdown files per record, plus fixed-name asset fields.
+- Directory records with multiple YAML/Markdown files and arbitrary configured filenames.
+- Single-file Markdown records with structured YAML frontmatter.
 - Type, required, range, length, regex, enum, duplicate-key, and relationship validation.
-- Atomic writes, path-field directory moves, and guarded deletes.
+- Atomic writes, path-field file/directory moves, and guarded deletes.
 
 ### Phase 2: query and cache — implemented foundation
 
@@ -86,7 +87,7 @@ Models can name output path templates under `outputs`. For example, `publication
 ## Concurrency and failures
 
 - A record file is written to a sibling temporary file and renamed into place.
-- A path-field change renames the whole record directory before rewriting configured fields.
+- A path-field change renames the record file or directory before rewriting configured fields.
 - Unknown keys in shared YAML documents are preserved.
 - Record creation/update is validated against the complete relationship graph before files change.
 - Deletion is rejected when another record references the target or a nested model record would be removed.

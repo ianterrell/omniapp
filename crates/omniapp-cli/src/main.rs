@@ -14,6 +14,7 @@ name: Book
 label: Books
 description: A collection of books stored as readable folders.
 storage:
+  kind: directory
   path: books/{slug}
 fields:
   slug:
