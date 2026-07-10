@@ -89,13 +89,19 @@ The server performs one complete cache build at startup, then a recursive filesy
 - Referenced target fields must be unique, preventing ambiguous graph edges.
 - Traversal is available through the Rust core, `omniapp relationships`, HTTP, and the record editor.
 
-### Phase 7: next implementation
+### Phase 7: generated output resolution — implemented
 
-1. Add generated-output resolution.
-2. Serve configured filesystem assets with schema-driven media previews.
-3. Implement relationship joins in declarative filters and specialized tree, board, calendar, gallery, and timeline renderers.
-4. Embed `sqlite-vec`; define an embedding-provider interface, dimension migration, and background job state.
-5. Add a sandboxed script host with capability grants. Scripts will call application services, never raw filesystem primitives.
+- Named output templates resolve against validated record fields to safe project-relative paths.
+- Resolution reports whether each destination currently exists as a file or directory.
+- The Rust core, `omniapp outputs`, HTTP, and record editor share the same output result.
+- OmniApp resolves destinations but does not claim generated artifacts as canonical record data.
+
+### Phase 8: next implementation
+
+1. Serve configured filesystem assets with schema-driven media previews.
+2. Implement relationship joins in declarative filters and specialized tree, board, calendar, gallery, and timeline renderers.
+3. Embed `sqlite-vec`; define an embedding-provider interface, dimension migration, and background job state.
+4. Add a sandboxed script host with capability grants. Scripts will call application services, never raw filesystem primitives.
 
 ## Scripting boundary
 
@@ -103,7 +109,7 @@ The server performs one complete cache build at startup, then a recursive filesy
 
 ## Generated outputs
 
-Models can name output path templates under `outputs`. For example, `publication: build/{slug}` establishes a discoverable destination without putting executable behavior into a model. A script or future CLI command resolves the template for a record and writes the artifact there. Output paths are project-relative and cannot traverse above the project root.
+Models name output path templates under `outputs`. For example, `publication: build/{slug}` establishes a discoverable destination without putting executable behavior into a model. `omniapp outputs`, the core service, and HTTP resolve templates for a record and inspect the current filesystem destination. Output paths are project-relative, cannot enter `.omniapp`, and cannot traverse above the project root.
 
 ## Concurrency and failures
 

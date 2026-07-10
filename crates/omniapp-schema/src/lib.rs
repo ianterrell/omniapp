@@ -467,14 +467,48 @@ pub fn validate_model(model: &Model) -> Vec<Problem> {
         }
     }
     for (name, path) in &model.outputs {
-        if path.starts_with('/') || path.split('/').any(|part| part == "..") {
+        if !valid_output_template(path) || path.split('/').next() == Some(".omniapp") {
             problems.push(Problem::new(
                 format!("{location}.outputs.{name}"),
                 "must be a safe project-relative path template",
             ));
         }
+        for placeholder in path_placeholders(path) {
+            if !model.fields.contains_key(&placeholder) {
+                problems.push(Problem::new(
+                    format!("{location}.outputs.{name}"),
+                    format!("references unknown field {placeholder:?}"),
+                ));
+            }
+        }
     }
     problems
+}
+
+fn valid_output_template(template: &str) -> bool {
+    if !is_safe_relative(template) {
+        return false;
+    }
+    let mut remaining = template;
+    while let Some(index) = remaining.find(['{', '}']) {
+        if remaining.as_bytes()[index] == b'}' {
+            return false;
+        }
+        let after_start = &remaining[index + 1..];
+        let Some(end) = after_start.find('}') else {
+            return false;
+        };
+        let field = &after_start[..end];
+        if field.is_empty()
+            || !field
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        {
+            return false;
+        }
+        remaining = &after_start[end + 1..];
+    }
+    !remaining.contains('}')
 }
 
 #[must_use]

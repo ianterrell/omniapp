@@ -208,6 +208,13 @@ enum Command {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
+    /// Resolve named generated-output paths for a record.
+    Outputs {
+        model: String,
+        key: String,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -259,6 +266,7 @@ async fn main() -> Result<()> {
         Command::Relationships { model, key, path } => {
             commands::relationships(&path, &model, &key, cli.json)
         }
+        Command::Outputs { model, key, path } => commands::outputs(&path, &model, &key, cli.json),
     }
 }
 
@@ -361,6 +369,7 @@ omniapp delete <Model> <id-or-slug>
 omniapp query <view>
 omniapp search <query>
 omniapp relationships <Model> <id-or-slug>
+omniapp outputs <Model> <id-or-slug>
 omniapp serve
 ```
 

@@ -260,6 +260,37 @@ pub fn relationships(path: &Path, model_name: &str, selector: &str, json: bool) 
     Ok(())
 }
 
+pub fn outputs(path: &Path, model_name: &str, selector: &str, json: bool) -> Result<()> {
+    let workspace = Workspace::new(path);
+    let loaded = workspace.load()?;
+    let model = loaded
+        .models
+        .get(model_name)
+        .with_context(|| format!("unknown model {model_name:?}"))?;
+    let records = workspace.records(model)?;
+    let key = resolve_record(&records, model_name, selector)?.key.clone();
+    let outputs = workspace.outputs(model_name, &key)?;
+    if json {
+        return print_json(&outputs);
+    }
+    println!("{} {:?}", outputs.record.model, outputs.record.key);
+    if outputs.outputs.is_empty() {
+        println!("No generated outputs are configured.");
+    } else {
+        for output in outputs.outputs {
+            let state = if output.is_file {
+                "file"
+            } else if output.is_directory {
+                "directory"
+            } else {
+                "not generated"
+            };
+            println!("  {}: {} ({state})", output.name, output.path.display());
+        }
+    }
+    Ok(())
+}
+
 fn read_values(sets: &[String], input: Option<&Path>) -> Result<BTreeMap<String, Value>> {
     let mut values = if let Some(input) = input {
         let contents = if input == Path::new("-") {

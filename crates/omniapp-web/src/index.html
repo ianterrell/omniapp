@@ -102,7 +102,7 @@
         else{const type={integer:'number',number:'number',date:'date',date_time:'datetime-local'}[field.type]||'text';const readonly=field.source.kind==='asset'?' readonly':'';input=`<input id="f-${esc(name)}" name="${esc(name)}" type="${type}" value="${esc(value)}"${required}${readonly}>`}
         wrap.innerHTML=`<label for="f-${esc(name)}">${esc(field.label||name)}${field.required?' *':''} ${field.description?`<small>— ${esc(field.description)}</small>`:''}</label>${input}`;form.append(wrap)
       }
-      if(record){const relations=document.createElement('div');relations.id='relations';relations.className='relations';relations.innerHTML='<h3>Relationships</h3><span class="subtitle">Resolving…</span>';form.append(relations);loadRelationships(record)}
+      if(record){const relations=document.createElement('div');relations.id='relations';relations.className='relations';relations.innerHTML='<h3>Relationships</h3><span class="subtitle">Resolving…</span>';form.append(relations);loadRelationships(record);const outputs=document.createElement('div');outputs.id='outputs';outputs.className='relations';outputs.innerHTML='<h3>Generated outputs</h3><span class="subtitle">Resolving…</span>';form.append(outputs);loadOutputs(record)}
       const actions=document.createElement('div');actions.className='dialog-actions';actions.innerHTML=`${record?'<span class="delete-wrap"><button type="button" class="btn danger" id="deleteButton">Delete</button></span>':''}<button type="button" class="btn" id="cancelButton">Cancel</button><button class="btn primary">Save</button>`;form.append(actions);
       $('#cancelButton').onclick=()=>$('#editor').close();if(record)$('#deleteButton').onclick=removeRecord;form.onsubmit=saveRecord;$('#editor').showModal()
     }
@@ -110,6 +110,11 @@
       const target=$('#relations');if(!target)return;
       try{const data=await api(`/api/models/${encodeURIComponent(record.model)}/record/relationships?key=${encodeURIComponent(record.key)}`);const links=[...data.outbound.map(link=>`<div class="relation"><span class="badge">${esc(link.field)} →</span><span>${esc(link.record.model)} · ${esc(link.record.key)}</span></div>`),...data.inbound.map(link=>`<div class="relation"><span class="badge">← ${esc(link.field)}</span><span>${esc(link.record.model)} · ${esc(link.record.key)}</span></div>`)];target.innerHTML=`<h3>Relationships</h3>${links.join('')||'<span class="subtitle">No related records</span>'}`}
       catch(error){target.innerHTML=`<h3>Relationships</h3><span class="error">${esc(error.message)}</span>`}
+    }
+    async function loadOutputs(record){
+      const target=$('#outputs');if(!target)return;
+      try{const data=await api(`/api/models/${encodeURIComponent(record.model)}/record/outputs?key=${encodeURIComponent(record.key)}`);target.innerHTML=`<h3>Generated outputs</h3>${data.outputs.map(output=>`<div class="relation"><span class="badge">${esc(output.name)}</span><span>${esc(output.path)} · ${output.exists?(output.is_file?'file':'directory'):'not generated'}</span></div>`).join('')||'<span class="subtitle">No outputs configured</span>'}`}
+      catch(error){target.innerHTML=`<h3>Generated outputs</h3><span class="error">${esc(error.message)}</span>`}
     }
     async function saveRecord(e){
       e.preventDefault();const model=state.project.models[state.view.model],values={};

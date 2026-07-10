@@ -16,7 +16,9 @@ use walkdir::WalkDir;
 
 use crate::document::MarkdownDocument;
 use crate::yaml_edit::update_mapping;
-use crate::{Cache, Record, RecordInput, RelationshipLink, RelationshipSet};
+use crate::{
+    Cache, GeneratedOutput, OutputSet, Record, RecordInput, RelationshipLink, RelationshipSet,
+};
 
 #[derive(Debug, Error)]
 pub enum WorkspaceError {
@@ -224,6 +226,35 @@ impl Workspace {
             outbound,
             inbound,
         })
+    }
+
+    pub fn outputs(&self, model_name: &str, key: &str) -> Result<OutputSet, WorkspaceError> {
+        let loaded = self.load()?;
+        let model = loaded
+            .models
+            .get(model_name)
+            .ok_or_else(|| WorkspaceError::UnknownModel(model_name.to_owned()))?;
+        let record = self
+            .records(model)?
+            .into_iter()
+            .find(|record| record.key == key)
+            .ok_or_else(|| WorkspaceError::UnknownRecord {
+                model: model_name.to_owned(),
+                key: key.to_owned(),
+            })?;
+        let mut outputs = Vec::new();
+        for (name, template) in &model.outputs {
+            let path = render_output_path(template, &record.values)?;
+            let absolute = self.root.join(&path);
+            outputs.push(GeneratedOutput {
+                name: name.clone(),
+                path,
+                exists: absolute.exists(),
+                is_file: absolute.is_file(),
+                is_directory: absolute.is_dir(),
+            });
+        }
+        Ok(OutputSet { record, outputs })
     }
 
     pub fn validate(&self) -> Result<ValidationReport, WorkspaceError> {
@@ -789,6 +820,54 @@ fn render_storage_path(
     Ok(path)
 }
 
+fn render_output_path(
+    template: &str,
+    values: &BTreeMap<String, Value>,
+) -> Result<PathBuf, WorkspaceError> {
+    let mut path = PathBuf::new();
+    for segment in template.split('/') {
+        let mut rendered = String::new();
+        let mut remaining = segment;
+        while let Some(start) = remaining.find('{') {
+            rendered.push_str(&remaining[..start]);
+            let after_start = &remaining[start + 1..];
+            let end = after_start.find('}').ok_or_else(|| {
+                WorkspaceError::Invalid(format!("invalid output template {template:?}"))
+            })?;
+            let field = &after_start[..end];
+            let value = values.get(field).ok_or_else(|| {
+                WorkspaceError::Invalid(format!(
+                    "output template field {field:?} is missing from the record"
+                ))
+            })?;
+            let value = match value {
+                Value::String(value) => value.clone(),
+                Value::Number(value) => value.to_string(),
+                _ => {
+                    return Err(WorkspaceError::Invalid(format!(
+                        "output template field {field:?} must be a string or number"
+                    )));
+                }
+            };
+            if value.is_empty() || value.contains(['/', '\\']) {
+                return Err(WorkspaceError::Invalid(format!(
+                    "output template field {field:?} is not a safe path component"
+                )));
+            }
+            rendered.push_str(&value);
+            remaining = &after_start[end + 1..];
+        }
+        rendered.push_str(remaining);
+        if matches!(rendered.as_str(), "" | "." | "..") {
+            return Err(WorkspaceError::Invalid(format!(
+                "output template rendered unsafe segment {rendered:?}"
+            )));
+        }
+        path.push(rendered);
+    }
+    Ok(path)
+}
+
 fn render_template_segment(
     template: &str,
     values: &BTreeMap<String, Value>,
@@ -1330,7 +1409,10 @@ mod tests {
                     ),
                 ),
             ]),
-            outputs: BTreeMap::new(),
+            outputs: BTreeMap::from([(
+                "publication".into(),
+                "build/{slug}/book-{slug}.pdf".into(),
+            )]),
         };
         fs::write(
             directory.path().join(".omniapp/models/book.yml"),
@@ -1351,6 +1433,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(record.values["title"], "Dune");
+        let outputs = workspace.outputs("Book", &record.key).unwrap();
+        assert_eq!(
+            outputs.outputs[0].path,
+            Path::new("build/dune/book-dune.pdf")
+        );
+        assert!(!outputs.outputs[0].exists);
+        fs::create_dir_all(directory.path().join("build/dune")).unwrap();
+        fs::write(directory.path().join("build/dune/book-dune.pdf"), b"pdf").unwrap();
+        assert!(workspace.outputs("Book", &record.key).unwrap().outputs[0].is_file);
         assert_eq!(
             fs::read_to_string(directory.path().join("books/dune/README.md")).unwrap(),
             "# Dune\n"
