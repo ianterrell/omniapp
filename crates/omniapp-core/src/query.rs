@@ -158,6 +158,7 @@ mod tests {
             key: key.into(),
             model: "Post".into(),
             path: PathBuf::new(),
+            revision: "test".into(),
             values: serde_json::from_value::<BTreeMap<String, Value>>(values).unwrap(),
         }
     }

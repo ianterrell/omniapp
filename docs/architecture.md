@@ -68,15 +68,21 @@ The server performs one complete cache build at startup, then a recursive filesy
 - Project/model/view/record/search HTTP endpoints.
 - Schema-driven table display and generated create/edit/delete forms.
 
-### Phase 4: next implementation
+### Phase 4: optimistic concurrency — implemented
 
-1. Add optimistic concurrency using file fingerprints so external edits cannot be silently overwritten by a stale form.
-2. Preserve comments and formatting when configured YAML/frontmatter keys change.
-3. Add relationship traversal/backreference services and generated-output resolution.
-4. Serve configured filesystem assets with schema-driven media previews.
-5. Implement specialized tree, board, calendar, gallery, and timeline renderers against the existing view/query contract.
-6. Embed `sqlite-vec`; define an embedding-provider interface, dimension migration, and background job state.
-7. Add a sandboxed script host with capability grants. Scripts will call application services, never raw filesystem primitives.
+- Every record read includes a SHA-256 revision of files OmniApp can rewrite.
+- Updates and deletes require the revision observed by the caller.
+- Stale HTTP mutations return `409 Conflict`; the CLI submits a freshly read revision automatically.
+- Configured large asset files are excluded from revision hashing because OmniApp does not rewrite their bytes.
+
+### Phase 5: next implementation
+
+1. Preserve comments and formatting when configured YAML/frontmatter keys change.
+2. Add relationship traversal/backreference services and generated-output resolution.
+3. Serve configured filesystem assets with schema-driven media previews.
+4. Implement specialized tree, board, calendar, gallery, and timeline renderers against the existing view/query contract.
+5. Embed `sqlite-vec`; define an embedding-provider interface, dimension migration, and background job state.
+6. Add a sandboxed script host with capability grants. Scripts will call application services, never raw filesystem primitives.
 
 ## Scripting boundary
 
@@ -89,6 +95,7 @@ Models can name output path templates under `outputs`. For example, `publication
 ## Concurrency and failures
 
 - A record file is written to a sibling temporary file and renamed into place.
+- Updates and deletes compare the caller's record revision before touching the filesystem.
 - A path-field change renames the record file or directory before rewriting configured fields.
 - Unknown keys in shared YAML documents are preserved.
 - Record creation/update is validated against the complete relationship graph before files change.

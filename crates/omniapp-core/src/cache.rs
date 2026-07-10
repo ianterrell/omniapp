@@ -33,6 +33,17 @@ pub struct SearchHit {
 impl Cache {
     pub fn open(path: &Path) -> Result<Self, CacheError> {
         let connection = Connection::open(path)?;
+        let cache_version: u32 =
+            connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if cache_version != 2 {
+            connection.execute_batch(
+                "DROP TABLE IF EXISTS records;
+                 DROP TABLE IF EXISTS records_fts;
+                 DROP TABLE IF EXISTS vector_embeddings;
+                 DROP TABLE IF EXISTS cache_metadata;
+                 PRAGMA user_version = 2;",
+            )?;
+        }
         connection.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA foreign_keys = ON;
@@ -44,6 +55,7 @@ impl Cache {
                model TEXT NOT NULL,
                record_key TEXT NOT NULL,
                path TEXT NOT NULL,
+               revision TEXT NOT NULL,
                data TEXT NOT NULL,
                PRIMARY KEY(model, record_key)
              );
@@ -218,7 +230,7 @@ impl Cache {
             i64::try_from((page - 1).saturating_mul(page_size)).unwrap_or(i64::MAX),
         ));
         let select_sql = format!(
-            "SELECT model, record_key, path, data FROM records
+            "SELECT model, record_key, path, revision, data FROM records
              WHERE {where_clause}
              ORDER BY {}
              LIMIT ? OFFSET ?",
@@ -275,8 +287,8 @@ fn insert_record(connection: &Connection, record: &Record) -> Result<(), CacheEr
         .join("\n");
     let path = record.path.to_string_lossy();
     connection.execute(
-        "INSERT INTO records(model, record_key, path, data) VALUES (?1, ?2, ?3, ?4)",
-        params![record.model, record.key, path, data],
+        "INSERT INTO records(model, record_key, path, revision, data) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![record.model, record.key, path, record.revision, data],
     )?;
     connection.execute(
         "INSERT INTO records_fts(model, record_key, path, content) VALUES (?1, ?2, ?3, ?4)",
@@ -286,7 +298,7 @@ fn insert_record(connection: &Connection, record: &Record) -> Result<(), CacheEr
 }
 
 fn record_from_row(row: &Row<'_>) -> rusqlite::Result<Record> {
-    let data: String = row.get(3)?;
+    let data: String = row.get(4)?;
     let values = serde_json::from_str::<BTreeMap<String, Value>>(&data).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(
             data.len(),
@@ -298,6 +310,7 @@ fn record_from_row(row: &Row<'_>) -> rusqlite::Result<Record> {
         model: row.get(0)?,
         key: row.get(1)?,
         path: PathBuf::from(row.get::<_, String>(2)?),
+        revision: row.get(3)?,
         values,
     })
 }
@@ -327,6 +340,7 @@ mod tests {
                 key: "dune".into(),
                 model: "Book".into(),
                 path: PathBuf::from("books/dune"),
+                revision: "test".into(),
                 values: BTreeMap::from([
                     ("title".into(), json!("Dune")),
                     ("notes".into(), json!("Fear is the mind-killer")),
@@ -392,6 +406,7 @@ mod tests {
             key: key.into(),
             model: "Post".into(),
             path: PathBuf::from(format!("posts/{key}.md")),
+            revision: "test".into(),
             values: serde_json::from_value(values).unwrap(),
         }
     }

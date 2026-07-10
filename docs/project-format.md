@@ -133,6 +133,8 @@ Validation supports `min`, `max`, `min_length`, `max_length`, `pattern`, and `ch
 
 Record identity is the string or integer `id` field when present, otherwise the project-relative record file or directory. An explicit stable `id` is recommended when path fields are frequently renamed or other systems retain record URLs.
 
+Every record returned by the core, CLI JSON output, or HTTP API also has a `revision`. Update bodies include that revision, and delete requests pass it as a query parameter. A revision mismatch means project files changed after the caller read them; OmniApp rejects the mutation instead of overwriting those changes.
+
 ## Views and queries
 
 This view answers “all social posts scheduled but not posted, ordered by date, paginated”:

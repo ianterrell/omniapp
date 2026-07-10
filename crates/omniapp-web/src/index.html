@@ -111,11 +111,11 @@
           if(value===''){value=null}else if(field.type==='integer'){value=parseInt(value,10)}else if(field.type==='number'){value=parseFloat(value)}else if(field.type==='json'){value=JSON.parse(value)}else if(field.type==='date_time'){value=new Date(value).toISOString()}
           values[name]=value
         }
-        const options={method:state.editing?'PUT':'POST',headers:{'content-type':'application/json'},body:JSON.stringify({values})};let url=`/api/models/${encodeURIComponent(state.view.model)}/records`;if(state.editing)url=`/api/models/${encodeURIComponent(state.view.model)}/record?key=${encodeURIComponent(state.editing.key)}`;
+        const options={method:state.editing?'PUT':'POST',headers:{'content-type':'application/json'},body:JSON.stringify({revision:state.editing?.revision??null,values})};let url=`/api/models/${encodeURIComponent(state.view.model)}/records`;if(state.editing)url=`/api/models/${encodeURIComponent(state.view.model)}/record?key=${encodeURIComponent(state.editing.key)}`;
         await api(url,options);$('#editor').close();await load()
       }catch(err){alert(err.message)}
     }
-    async function removeRecord(){if(!confirm('Delete this record from disk?'))return;try{await api(`/api/models/${encodeURIComponent(state.view.model)}/record?key=${encodeURIComponent(state.editing.key)}`,{method:'DELETE'});$('#editor').close();await load()}catch(e){alert(e.message)}}
+    async function removeRecord(){if(!confirm('Delete this record from disk?'))return;try{await api(`/api/models/${encodeURIComponent(state.view.model)}/record?key=${encodeURIComponent(state.editing.key)}&revision=${encodeURIComponent(state.editing.revision)}`,{method:'DELETE'});$('#editor').close();await load()}catch(e){alert(e.message)}}
     function showError(message){$('#content').innerHTML=`<div class="error">${esc(message)}</div>`}
     $('#newButton').onclick=()=>openEditor();$('#filter').oninput=()=>state.result&&renderTable();$('.close').onclick=()=>$('#editor').close();boot();
   </script>

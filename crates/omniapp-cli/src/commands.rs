@@ -65,7 +65,14 @@ pub fn create(
 ) -> Result<()> {
     let values = read_values(sets, input)?;
     let workspace = Workspace::new(path);
-    let record = workspace.save_record(model_name, None, RecordInput { values })?;
+    let record = workspace.save_record(
+        model_name,
+        None,
+        RecordInput {
+            revision: None,
+            values,
+        },
+    )?;
     if json {
         print_json(&record)
     } else {
@@ -98,8 +105,16 @@ pub fn update(
         .get(model_name)
         .with_context(|| format!("unknown model {model_name:?}"))?;
     let records = workspace.records(model)?;
-    let key = resolve_record(&records, model_name, selector)?.key.clone();
-    let record = workspace.save_record(model_name, Some(&key), RecordInput { values })?;
+    let existing = resolve_record(&records, model_name, selector)?;
+    let key = existing.key.clone();
+    let record = workspace.save_record(
+        model_name,
+        Some(&key),
+        RecordInput {
+            revision: Some(existing.revision.clone()),
+            values,
+        },
+    )?;
     if json {
         print_json(&record)
     } else {
@@ -123,8 +138,9 @@ pub fn delete(path: &Path, model_name: &str, selector: &str, json: bool) -> Resu
     let records = workspace.records(model)?;
     let record = resolve_record(&records, model_name, selector)?;
     let key = record.key.clone();
+    let revision = record.revision.clone();
     let record_path = record.path.clone();
-    workspace.delete_record(model_name, &key)?;
+    workspace.delete_record(model_name, &key, Some(&revision))?;
     if json {
         print_json(&json!({
             "deleted": true,
@@ -482,6 +498,7 @@ mod tests {
             key: "books/dune".into(),
             model: "Book".into(),
             path: PathBuf::from("books/dune"),
+            revision: "test".into(),
             values: BTreeMap::from([("slug".into(), json!("dune"))]),
         }];
         assert_eq!(

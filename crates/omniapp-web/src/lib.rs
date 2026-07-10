@@ -32,6 +32,8 @@ struct PageParams {
 #[derive(Debug, Deserialize)]
 struct KeyParams {
     key: String,
+    #[serde(default)]
+    revision: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -174,7 +176,9 @@ async fn delete_record(
     Path(model): Path<String>,
     Query(params): Query<KeyParams>,
 ) -> Result<StatusCode, ApiError> {
-    state.workspace.delete_record(&model, &params.key)?;
+    state
+        .workspace
+        .delete_record(&model, &params.key, params.revision.as_deref())?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -212,6 +216,7 @@ impl From<WorkspaceError> for ApiError {
             WorkspaceError::UnknownModel(_) | WorkspaceError::UnknownRecord { .. } => {
                 StatusCode::NOT_FOUND
             }
+            WorkspaceError::Conflict { .. } => StatusCode::CONFLICT,
             WorkspaceError::Invalid(_) | WorkspaceError::Schema(_) => StatusCode::BAD_REQUEST,
             WorkspaceError::Io { .. } | WorkspaceError::Cache(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR

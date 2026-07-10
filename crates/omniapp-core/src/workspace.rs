@@ -10,6 +10,7 @@ use omniapp_schema::{
 use regex::Regex;
 use serde::Serialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use walkdir::WalkDir;
 
@@ -31,6 +32,8 @@ pub enum WorkspaceError {
     UnknownModel(String),
     #[error("unknown record {key:?} for model {model:?}")]
     UnknownRecord { model: String, key: String },
+    #[error("record {model} {key:?} changed since it was read; reload it before writing")]
+    Conflict { model: String, key: String },
     #[error("cache operation failed: {0}")]
     Cache(#[from] crate::cache::CacheError),
 }
@@ -266,6 +269,14 @@ impl Workspace {
         } else {
             None
         };
+        if let Some(existing) = &existing
+            && input.revision.as_deref() != Some(&existing.revision)
+        {
+            return Err(WorkspaceError::Conflict {
+                model: model_name.to_owned(),
+                key: existing.key.clone(),
+            });
+        }
 
         let mut values = existing
             .as_ref()
@@ -296,6 +307,9 @@ impl Workspace {
             key: record_key(&target_relative, &values),
             model: model.name.clone(),
             path: target_relative.clone(),
+            revision: existing
+                .as_ref()
+                .map_or_else(String::new, |record| record.revision.clone()),
             values: values.clone(),
         };
         let mut validation = Vec::new();
@@ -370,7 +384,12 @@ impl Workspace {
         Ok(record)
     }
 
-    pub fn delete_record(&self, model_name: &str, key: &str) -> Result<(), WorkspaceError> {
+    pub fn delete_record(
+        &self,
+        model_name: &str,
+        key: &str,
+        expected_revision: Option<&str>,
+    ) -> Result<(), WorkspaceError> {
         let loaded = self.load()?;
         let model = loaded
             .models
@@ -384,6 +403,12 @@ impl Workspace {
                 model: model_name.to_owned(),
                 key: key.to_owned(),
             })?;
+        if expected_revision != Some(&record.revision) {
+            return Err(WorkspaceError::Conflict {
+                model: model_name.to_owned(),
+                key: record.key.clone(),
+            });
+        }
         let all_records = self.all_records(&loaded)?;
         for candidate in &all_records {
             if matches!(&model.storage, Storage::Directory { .. })
@@ -534,6 +559,7 @@ impl Workspace {
             key: record_key(&relative, &values),
             model: model.name.clone(),
             path: relative,
+            revision: record_revision(model, location)?,
             values,
         })
     }
@@ -856,6 +882,41 @@ fn source_path(
     }
 }
 
+fn record_revision(model: &Model, location: &Path) -> Result<String, WorkspaceError> {
+    let mut files = BTreeSet::new();
+    match &model.storage {
+        Storage::File { .. } => {
+            files.insert(location.to_path_buf());
+        }
+        Storage::Directory { .. } => {
+            for field in model.fields.values() {
+                let file = match &field.source {
+                    FieldSource::Yaml { file, .. } => Some(file.as_str()),
+                    FieldSource::Markdown { file } | FieldSource::Frontmatter { file, .. } => {
+                        file.as_deref()
+                    }
+                    FieldSource::Path { .. } | FieldSource::Asset { .. } => None,
+                };
+                if let Some(file) = file {
+                    files.insert(location.join(file));
+                }
+            }
+        }
+    }
+    let mut hasher = Sha256::new();
+    for path in files {
+        let relative = path.strip_prefix(location).unwrap_or(&path);
+        hasher.update(relative.as_os_str().as_encoded_bytes());
+        hasher.update([0]);
+        if path.exists() {
+            let contents = fs::read(&path).map_err(|source| io_error(&path, source))?;
+            hasher.update(contents);
+        }
+        hasher.update([0]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), WorkspaceError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| io_error(parent, source))?;
@@ -1165,6 +1226,7 @@ mod tests {
                 "Book",
                 None,
                 RecordInput {
+                    revision: None,
                     values: serde_json::from_value(
                         json!({"slug":"dune", "title":"Dune", "body":"# Dune\n"}),
                     )
@@ -1242,6 +1304,7 @@ mod tests {
                 "Article",
                 None,
                 RecordInput {
+                    revision: None,
                     values: serde_json::from_value(
                         json!({"slug":"local-first", "title":"Local First", "body":"# Draft\n"}),
                     )
@@ -1319,6 +1382,7 @@ mod tests {
                 "Post",
                 None,
                 RecordInput {
+                    revision: None,
                     values: serde_json::from_value(json!({
                         "date":"2026-07-10",
                         "slug":"hello",
@@ -1337,11 +1401,23 @@ mod tests {
         )
         .unwrap();
 
+        let stale = workspace.save_record(
+            "Post",
+            Some(&created.key),
+            RecordInput {
+                revision: Some(created.revision.clone()),
+                values: serde_json::from_value(json!({"title":"Stale title"})).unwrap(),
+            },
+        );
+        assert!(matches!(stale, Err(WorkspaceError::Conflict { .. })));
+        let current = workspace.records(&model).unwrap().remove(0);
+
         let updated = workspace
             .save_record(
                 "Post",
                 Some(&created.key),
                 RecordInput {
+                    revision: Some(current.revision),
                     values: serde_json::from_value(json!({
                         "slug":"hello-world",
                         "title":"Hello World"
@@ -1360,7 +1436,9 @@ mod tests {
         assert_eq!(updated.values["slug"], "hello-world");
         assert!(workspace.validate().unwrap().is_valid());
 
-        workspace.delete_record("Post", &updated.key).unwrap();
+        workspace
+            .delete_record("Post", &updated.key, Some(&updated.revision))
+            .unwrap();
         assert!(!moved.exists());
     }
 
