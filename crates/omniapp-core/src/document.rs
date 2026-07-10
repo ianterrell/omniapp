@@ -4,10 +4,12 @@ use std::path::Path;
 use serde_yaml::{Mapping, Value};
 
 use crate::WorkspaceError;
+use crate::yaml_edit::update_mapping;
 
 #[derive(Debug, Default)]
 pub(crate) struct MarkdownDocument {
     pub frontmatter: Mapping,
+    pub frontmatter_source: String,
     pub body: String,
     pub had_frontmatter: bool,
 }
@@ -74,25 +76,44 @@ impl MarkdownDocument {
         };
         Ok(Self {
             frontmatter,
+            frontmatter_source: yaml,
             body: contents[consumed..].to_owned(),
             had_frontmatter: true,
         })
     }
 
-    pub fn render(&self, force_frontmatter: bool) -> Result<String, WorkspaceError> {
+    pub fn render(&self, force_frontmatter: bool) -> String {
         if !force_frontmatter && !self.had_frontmatter && self.frontmatter.is_empty() {
-            return Ok(self.body.clone());
+            return self.body.clone();
         }
-        let yaml = if self.frontmatter.is_empty() {
-            String::new()
+        let mut yaml = self.frontmatter_source.clone();
+        if !yaml.is_empty() && !yaml.ends_with('\n') {
+            yaml.push('\n');
+        }
+        format!("---\n{yaml}---\n{}", self.body)
+    }
+
+    pub fn update_frontmatter(
+        &mut self,
+        updates: &[(String, Option<Value>)],
+    ) -> Result<(), WorkspaceError> {
+        self.frontmatter_source = update_mapping(&self.frontmatter_source, updates)?;
+        self.frontmatter = if self.frontmatter_source.trim().is_empty() {
+            Mapping::new()
         } else {
-            serde_yaml::to_string(&self.frontmatter).map_err(|error| {
-                WorkspaceError::Invalid(format!(
-                    "could not serialize Markdown frontmatter: {error}"
-                ))
-            })?
+            serde_yaml::from_str::<Value>(&self.frontmatter_source)
+                .map_err(|error| {
+                    WorkspaceError::Invalid(format!(
+                        "could not parse updated Markdown frontmatter: {error}"
+                    ))
+                })?
+                .as_mapping()
+                .cloned()
+                .ok_or_else(|| {
+                    WorkspaceError::Invalid("Markdown frontmatter must be a mapping".into())
+                })?
         };
-        Ok(format!("---\n{yaml}---\n{}", self.body))
+        Ok(())
     }
 }
 
@@ -102,15 +123,14 @@ mod tests {
 
     #[test]
     fn parses_and_renders_frontmatter_without_losing_unknown_keys() {
-        let input = "---\ntitle: Dune\ncustom: keep-me\n---\n# Body\n";
+        let input = "---\n# title comment\ntitle: Dune # inline\ncustom: keep-me\n---\n# Body\n";
         let mut document = MarkdownDocument::parse(input, Path::new("post.md")).unwrap();
         assert_eq!(document.body, "# Body\n");
-        document.frontmatter.insert(
-            Value::String("title".into()),
-            Value::String("Dune Messiah".into()),
-        );
-        let rendered = document.render(true).unwrap();
-        assert!(rendered.contains("title: Dune Messiah"));
+        document
+            .update_frontmatter(&[("title".into(), Some(Value::String("Dune Messiah".into())))])
+            .unwrap();
+        let rendered = document.render(true);
+        assert!(rendered.contains("# title comment\ntitle: Dune Messiah # inline"));
         assert!(rendered.contains("custom: keep-me"));
         assert!(rendered.ends_with("---\n# Body\n"));
     }

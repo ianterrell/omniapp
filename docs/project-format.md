@@ -80,6 +80,8 @@ fields:
 
 This produces `articles/<slug>/manuscript.markdown`. Frontmatter fields and the body are parsed and written together atomically. Unknown frontmatter keys are retained.
 
+OmniApp patches configured top-level YAML/frontmatter keys instead of serializing the complete mapping. Comments, ordering, blank lines, quoting, and nested formatting outside a changed key remain untouched. A changed key keeps its inline comment, but its value is rendered in OmniApp's standard YAML style.
+
 ### Single-file records
 
 For a single-file record, the storage path is the Markdown document itself. Markdown and frontmatter sources omit `file` because they implicitly use that document:

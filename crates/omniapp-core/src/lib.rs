@@ -6,6 +6,7 @@ mod query;
 mod record;
 mod watcher;
 mod workspace;
+mod yaml_edit;
 
 pub use cache::{Cache, CacheError, SearchHit};
 pub use query::{Page, execute_query};

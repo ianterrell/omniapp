@@ -75,14 +75,20 @@ The server performs one complete cache build at startup, then a recursive filesy
 - Stale HTTP mutations return `409 Conflict`; the CLI submits a freshly read revision automatically.
 - Configured large asset files are excluded from revision hashing because OmniApp does not rewrite their bytes.
 
-### Phase 5: next implementation
+### Phase 5: format-preserving YAML writes — implemented
 
-1. Preserve comments and formatting when configured YAML/frontmatter keys change.
-2. Add relationship traversal/backreference services and generated-output resolution.
-3. Serve configured filesystem assets with schema-driven media previews.
-4. Implement specialized tree, board, calendar, gallery, and timeline renderers against the existing view/query contract.
-5. Embed `sqlite-vec`; define an embedding-provider interface, dimension migration, and background job state.
-6. Add a sandboxed script host with capability grants. Scripts will call application services, never raw filesystem primitives.
+- Standalone YAML and Markdown frontmatter use the same targeted top-level mapping editor.
+- Untouched keys, key ordering, blank lines, comments, quoting, and nested blocks remain byte-for-byte unchanged.
+- Updated keys retain inline comments while their value representation is regenerated.
+- Unknown fields continue to round-trip without becoming part of the model.
+
+### Phase 6: next implementation
+
+1. Add relationship traversal/backreference services and generated-output resolution.
+2. Serve configured filesystem assets with schema-driven media previews.
+3. Implement specialized tree, board, calendar, gallery, and timeline renderers against the existing view/query contract.
+4. Embed `sqlite-vec`; define an embedding-provider interface, dimension migration, and background job state.
+5. Add a sandboxed script host with capability grants. Scripts will call application services, never raw filesystem primitives.
 
 ## Scripting boundary
 
@@ -97,7 +103,7 @@ Models can name output path templates under `outputs`. For example, `publication
 - A record file is written to a sibling temporary file and renamed into place.
 - Updates and deletes compare the caller's record revision before touching the filesystem.
 - A path-field change renames the record file or directory before rewriting configured fields.
-- Unknown keys in shared YAML documents are preserved.
+- Unknown keys and untouched formatting/comments in shared YAML and frontmatter are preserved.
 - Record creation/update is validated against the complete relationship graph before files change.
 - Deletion is rejected when another record references the target or a nested model record would be removed.
 

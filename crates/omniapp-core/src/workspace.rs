@@ -15,6 +15,7 @@ use thiserror::Error;
 use walkdir::WalkDir;
 
 use crate::document::MarkdownDocument;
+use crate::yaml_edit::update_mapping;
 use crate::{Cache, Record, RecordInput};
 
 #[derive(Debug, Error)]
@@ -791,37 +792,22 @@ fn write_record_files(
         }
     }
     for (path, fields) in yaml_files {
-        let mut mapping = if path.exists() {
-            let contents = fs::read_to_string(&path).map_err(|source| io_error(&path, source))?;
-            serde_yaml::from_str::<serde_yaml::Value>(&contents)
-                .map_err(|error| {
-                    WorkspaceError::Invalid(format!("could not parse {}: {error}", path.display()))
-                })?
-                .as_mapping()
-                .cloned()
-                .ok_or_else(|| {
-                    WorkspaceError::Invalid(format!(
-                        "{} must contain a YAML mapping",
-                        path.display()
-                    ))
-                })?
+        let contents = if path.exists() {
+            fs::read_to_string(&path).map_err(|source| io_error(&path, source))?
         } else {
-            serde_yaml::Mapping::new()
+            String::new()
         };
+        let mut updates = Vec::new();
         for (key, value) in fields {
-            let yaml_key = serde_yaml::Value::String(key.to_owned());
-            if let Some(value) = value {
-                let yaml_value = serde_yaml::to_value(value).map_err(|error| {
+            let value = value
+                .map(serde_yaml::to_value)
+                .transpose()
+                .map_err(|error| {
                     WorkspaceError::Invalid(format!("could not serialize {key}: {error}"))
                 })?;
-                mapping.insert(yaml_key, yaml_value);
-            } else {
-                mapping.remove(&yaml_key);
-            }
+            updates.push((key.to_owned(), value));
         }
-        let contents = serde_yaml::to_string(&mapping).map_err(|error| {
-            WorkspaceError::Invalid(format!("could not serialize {}: {error}", path.display()))
-        })?;
+        let contents = update_mapping(&contents, &updates)?;
         atomic_write(&path, contents.as_bytes())?;
     }
     for (path, update) in markdown_files {
@@ -832,17 +818,20 @@ fn write_record_files(
             BodyUpdate::Set(body) => document.body = body,
         }
         let has_configured_frontmatter = !update.frontmatter.is_empty();
-        for (key, value) in update.frontmatter {
-            let yaml_key = serde_yaml::Value::String(key.clone());
-            if let Some(value) = value {
-                let yaml_value = serde_yaml::to_value(value).map_err(|error| {
-                    WorkspaceError::Invalid(format!("could not serialize {key}: {error}"))
-                })?;
-                document.frontmatter.insert(yaml_key, yaml_value);
-            } else {
-                document.frontmatter.remove(&yaml_key);
-            }
-        }
+        let frontmatter_updates = update
+            .frontmatter
+            .into_iter()
+            .map(|(key, value)| {
+                let value = value
+                    .map(serde_yaml::to_value)
+                    .transpose()
+                    .map_err(|error| {
+                        WorkspaceError::Invalid(format!("could not serialize {key}: {error}"))
+                    })?;
+                Ok((key, value))
+            })
+            .collect::<Result<Vec<_>, WorkspaceError>>()?;
+        document.update_frontmatter(&frontmatter_updates)?;
         if matches!(&model.storage, Storage::Directory { .. })
             && document.body.is_empty()
             && document.frontmatter.is_empty()
@@ -851,7 +840,7 @@ fn write_record_files(
                 fs::remove_file(&path).map_err(|source| io_error(path, source))?;
             }
         } else {
-            let contents = document.render(has_configured_frontmatter)?;
+            let contents = document.render(has_configured_frontmatter);
             atomic_write(&path, contents.as_bytes())?;
         }
     }
@@ -1240,13 +1229,37 @@ mod tests {
             "# Dune\n"
         );
         let yaml_path = directory.path().join("books/dune/book.yml");
-        fs::write(&yaml_path, "title: Dune Messiah\n").unwrap();
-        assert_eq!(workspace.refresh_cache_paths(&[yaml_path]).unwrap(), 1);
+        fs::write(
+            &yaml_path,
+            "# book metadata\ntitle: \"Dune Messiah\" # display title\nexternal:\n  keep: true # untouched\n",
+        )
+        .unwrap();
+        assert_eq!(
+            workspace
+                .refresh_cache_paths(std::slice::from_ref(&yaml_path))
+                .unwrap(),
+            1
+        );
         let cache = Cache::open(&workspace.metadata_dir().join("cache.sqlite3")).unwrap();
         let cached = cache
             .query("Book", &omniapp_schema::Query::default(), 1)
             .unwrap();
         assert_eq!(cached.records[0].values["title"], "Dune Messiah");
+        let current = workspace.records(&model).unwrap().remove(0);
+        workspace
+            .save_record(
+                "Book",
+                Some(&current.key),
+                RecordInput {
+                    revision: Some(current.revision),
+                    values: serde_json::from_value(json!({"title":"Children of Dune"})).unwrap(),
+                },
+            )
+            .unwrap();
+        let preserved = fs::read_to_string(&yaml_path).unwrap();
+        assert!(preserved.starts_with(
+            "# book metadata\ntitle: Children of Dune # display title\nexternal:\n  keep: true # untouched\n"
+        ));
         assert!(workspace.validate().unwrap().is_valid());
     }
 
@@ -1397,7 +1410,10 @@ mod tests {
         let contents = fs::read_to_string(&original).unwrap();
         fs::write(
             &original,
-            contents.replace("title: Hello\n", "title: Hello\nexternal: keep-me\n"),
+            contents.replace(
+                "title: Hello\n",
+                "# title comment\ntitle: Hello # keep inline\nexternal: keep-me\n",
+            ),
         )
         .unwrap();
 
@@ -1431,6 +1447,7 @@ mod tests {
         assert!(moved.exists());
         let contents = fs::read_to_string(&moved).unwrap();
         assert!(contents.contains("title: Hello World"));
+        assert!(contents.contains("# title comment\ntitle: Hello World # keep inline"));
         assert!(contents.contains("external: keep-me"));
         assert!(contents.ends_with("First draft.\n"));
         assert_eq!(updated.values["slug"], "hello-world");

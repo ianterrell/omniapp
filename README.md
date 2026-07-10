@@ -13,6 +13,7 @@ This repository contains the first working vertical slice of the architecture:
 - record/schema/reference validation;
 - atomic filesystem CRUD and safe relationship-aware deletion;
 - SHA-256 record revisions with optimistic concurrency protection;
+- targeted YAML/frontmatter edits that preserve untouched formatting and comments;
 - rebuildable SQLite FTS5 search cache and an embedding-ready cache table;
 - a local-only HTTP API and schema-generated table/form interface;
 - complete CLI record access with human-readable and JSON output.
