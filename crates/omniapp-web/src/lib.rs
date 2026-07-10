@@ -63,6 +63,10 @@ pub fn router(workspace: Workspace) -> Router {
             "/api/models/{model}/record",
             put(update_record).delete(delete_record),
         )
+        .route(
+            "/api/models/{model}/record/relationships",
+            get(record_relationships),
+        )
         .route("/api/views/{view}/records", get(view_records))
         .route("/api/search", get(search))
         .layer(TraceLayer::new_for_http())
@@ -180,6 +184,16 @@ async fn delete_record(
         .workspace
         .delete_record(&model, &params.key, params.revision.as_deref())?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn record_relationships(
+    State(state): State<AppState>,
+    Path(model): Path<String>,
+    Query(params): Query<KeyParams>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(serde_json::to_value(
+        state.workspace.relationships(&model, &params.key)?,
+    )?))
 }
 
 async fn search(

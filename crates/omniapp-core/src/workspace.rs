@@ -16,7 +16,7 @@ use walkdir::WalkDir;
 
 use crate::document::MarkdownDocument;
 use crate::yaml_edit::update_mapping;
-use crate::{Cache, Record, RecordInput};
+use crate::{Cache, Record, RecordInput, RelationshipLink, RelationshipSet};
 
 #[derive(Debug, Error)]
 pub enum WorkspaceError {
@@ -132,6 +132,98 @@ impl Workspace {
             records.extend(self.records(model)?);
         }
         Ok(records)
+    }
+
+    pub fn relationships(
+        &self,
+        model_name: &str,
+        key: &str,
+    ) -> Result<RelationshipSet, WorkspaceError> {
+        let loaded = self.load()?;
+        let model = loaded
+            .models
+            .get(model_name)
+            .ok_or_else(|| WorkspaceError::UnknownModel(model_name.to_owned()))?;
+        let records = self.all_records(&loaded)?;
+        let record = records
+            .iter()
+            .find(|record| record.model == model_name && record.key == key)
+            .cloned()
+            .ok_or_else(|| WorkspaceError::UnknownRecord {
+                model: model_name.to_owned(),
+                key: key.to_owned(),
+            })?;
+
+        let mut outbound = Vec::new();
+        for (field_name, field) in &model.fields {
+            let Some(reference) = &field.reference else {
+                continue;
+            };
+            let Some(value) = record.values.get(field_name) else {
+                continue;
+            };
+            let values = relationship_values(value, reference.many);
+            for target in records.iter().filter(|candidate| {
+                candidate.model == reference.model
+                    && candidate
+                        .values
+                        .get(&reference.field)
+                        .is_some_and(|value| values.contains(&value))
+            }) {
+                outbound.push(RelationshipLink {
+                    field: field_name.clone(),
+                    target_field: reference.field.clone(),
+                    record: target.clone(),
+                });
+            }
+        }
+
+        let mut inbound = Vec::new();
+        for candidate in &records {
+            let Some(candidate_model) = loaded.models.get(&candidate.model) else {
+                continue;
+            };
+            for (field_name, field) in &candidate_model.fields {
+                let Some(reference) = &field.reference else {
+                    continue;
+                };
+                if reference.model != record.model {
+                    continue;
+                }
+                let Some(target_value) = record.values.get(&reference.field) else {
+                    continue;
+                };
+                let Some(source_value) = candidate.values.get(field_name) else {
+                    continue;
+                };
+                if relationship_values(source_value, reference.many).contains(&target_value) {
+                    inbound.push(RelationshipLink {
+                        field: field_name.clone(),
+                        target_field: reference.field.clone(),
+                        record: candidate.clone(),
+                    });
+                }
+            }
+        }
+        outbound.sort_by(|left, right| {
+            (&left.field, &left.record.model, &left.record.key).cmp(&(
+                &right.field,
+                &right.record.model,
+                &right.record.key,
+            ))
+        });
+        inbound.sort_by(|left, right| {
+            (&left.record.model, &left.field, &left.record.key).cmp(&(
+                &right.record.model,
+                &right.field,
+                &right.record.key,
+            ))
+        });
+        Ok(RelationshipSet {
+            record,
+            outbound,
+            inbound,
+        })
     }
 
     pub fn validate(&self) -> Result<ValidationReport, WorkspaceError> {
@@ -1036,6 +1128,31 @@ fn validate_references(
     records: &[Record],
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    let targets = models
+        .values()
+        .flat_map(|model| model.fields.values())
+        .filter_map(|field| field.reference.as_ref())
+        .map(|reference| (reference.model.clone(), reference.field.clone()))
+        .collect::<BTreeSet<_>>();
+    for (model_name, field_name) in targets {
+        let mut seen = BTreeMap::new();
+        for record in records.iter().filter(|record| record.model == model_name) {
+            let Some(value) = record.values.get(&field_name) else {
+                continue;
+            };
+            let identity = value.to_string();
+            if let Some(previous) = seen.insert(identity, record.path.clone()) {
+                diagnostics.push(Diagnostic::error(
+                    format!("model {model_name}.fields.{field_name}"),
+                    format!(
+                        "relationship target values must be unique; {} and {} have {value}",
+                        previous.display(),
+                        record.path.display()
+                    ),
+                ));
+            }
+        }
+    }
     for record in records {
         let Some(model) = models.get(&record.model) else {
             continue;
@@ -1094,6 +1211,16 @@ fn is_scalar(value: &Value) -> bool {
     value.is_string() || value.is_number()
 }
 
+fn relationship_values(value: &Value, many: bool) -> Vec<&Value> {
+    if many {
+        value
+            .as_array()
+            .map_or_else(Vec::new, |values| values.iter().collect())
+    } else {
+        vec![value]
+    }
+}
+
 fn problems_to_diagnostics(problems: Vec<Problem>) -> Vec<Diagnostic> {
     problems
         .into_iter()
@@ -1134,7 +1261,7 @@ fn is_cache_path(relative: &Path) -> bool {
 mod tests {
     use std::collections::BTreeMap;
 
-    use omniapp_schema::{FieldSource, Storage, Validation};
+    use omniapp_schema::{FieldSource, Reference, Storage, Validation};
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -1457,6 +1584,128 @@ mod tests {
             .delete_record("Post", &updated.key, Some(&updated.revision))
             .unwrap();
         assert!(!moved.exists());
+    }
+
+    #[test]
+    fn resolves_outbound_relationships_and_inbound_backreferences() {
+        let directory = tempdir().unwrap();
+        let workspace = Workspace::new(directory.path());
+        let book = Model {
+            version: 1,
+            name: "Book".into(),
+            label: None,
+            description: None,
+            storage: Storage::Directory {
+                path: "books/{slug}".into(),
+            },
+            fields: BTreeMap::from([
+                (
+                    "slug".into(),
+                    field(
+                        FieldType::String,
+                        true,
+                        FieldSource::Path {
+                            variable: "slug".into(),
+                        },
+                    ),
+                ),
+                (
+                    "title".into(),
+                    field(
+                        FieldType::String,
+                        true,
+                        FieldSource::Yaml {
+                            file: "book.yml".into(),
+                            key: "title".into(),
+                        },
+                    ),
+                ),
+            ]),
+            outputs: BTreeMap::new(),
+        };
+        let mut book_reference = field(
+            FieldType::Reference,
+            true,
+            FieldSource::Path {
+                variable: "book".into(),
+            },
+        );
+        book_reference.reference = Some(Reference {
+            model: "Book".into(),
+            field: "slug".into(),
+            many: false,
+        });
+        let scene = Model {
+            version: 1,
+            name: "Scene".into(),
+            label: None,
+            description: None,
+            storage: Storage::Directory {
+                path: "books/{book}/scenes/{slug}".into(),
+            },
+            fields: BTreeMap::from([
+                ("book".into(), book_reference),
+                (
+                    "slug".into(),
+                    field(
+                        FieldType::String,
+                        true,
+                        FieldSource::Path {
+                            variable: "slug".into(),
+                        },
+                    ),
+                ),
+                (
+                    "title".into(),
+                    field(
+                        FieldType::String,
+                        true,
+                        FieldSource::Yaml {
+                            file: "scene.yml".into(),
+                            key: "title".into(),
+                        },
+                    ),
+                ),
+            ]),
+            outputs: BTreeMap::new(),
+        };
+        write_test_project(directory.path(), &book);
+        fs::write(
+            directory.path().join(".omniapp/models/scene.yml"),
+            serde_yaml::to_string(&scene).unwrap(),
+        )
+        .unwrap();
+        let book_record = workspace
+            .save_record(
+                "Book",
+                None,
+                RecordInput {
+                    revision: None,
+                    values: serde_json::from_value(json!({"slug":"dune", "title":"Dune"})).unwrap(),
+                },
+            )
+            .unwrap();
+        let scene_record = workspace
+            .save_record(
+                "Scene",
+                None,
+                RecordInput {
+                    revision: None,
+                    values: serde_json::from_value(json!({
+                        "book":"dune", "slug":"arrival", "title":"Arrival"
+                    }))
+                    .unwrap(),
+                },
+            )
+            .unwrap();
+
+        let scene_links = workspace.relationships("Scene", &scene_record.key).unwrap();
+        assert_eq!(scene_links.outbound.len(), 1);
+        assert_eq!(scene_links.outbound[0].record.key, book_record.key);
+        let book_links = workspace.relationships("Book", &book_record.key).unwrap();
+        assert_eq!(book_links.inbound.len(), 1);
+        assert_eq!(book_links.inbound[0].record.key, scene_record.key);
+        assert!(workspace.validate().unwrap().is_valid());
     }
 
     fn write_test_project(root: &Path, model: &Model) {

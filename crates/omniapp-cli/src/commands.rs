@@ -212,6 +212,54 @@ pub fn search(path: &Path, search_query: &str, limit: usize, json: bool) -> Resu
     }
 }
 
+pub fn relationships(path: &Path, model_name: &str, selector: &str, json: bool) -> Result<()> {
+    let workspace = Workspace::new(path);
+    let loaded = workspace.load()?;
+    let model = loaded
+        .models
+        .get(model_name)
+        .with_context(|| format!("unknown model {model_name:?}"))?;
+    let records = workspace.records(model)?;
+    let key = resolve_record(&records, model_name, selector)?.key.clone();
+    let relationships = workspace.relationships(model_name, &key)?;
+    if json {
+        return print_json(&relationships);
+    }
+    println!(
+        "{} {:?}",
+        relationships.record.model, relationships.record.key
+    );
+    println!("Outbound relationships:");
+    if relationships.outbound.is_empty() {
+        println!("  None");
+    } else {
+        for link in relationships.outbound {
+            println!(
+                "  {} -> {} {:?} ({})",
+                link.field,
+                link.record.model,
+                link.record.key,
+                link.record.path.display()
+            );
+        }
+    }
+    println!("Inbound backreferences:");
+    if relationships.inbound.is_empty() {
+        println!("  None");
+    } else {
+        for link in relationships.inbound {
+            println!(
+                "  {} {:?} via {} ({})",
+                link.record.model,
+                link.record.key,
+                link.field,
+                link.record.path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 fn read_values(sets: &[String], input: Option<&Path>) -> Result<BTreeMap<String, Value>> {
     let mut values = if let Some(input) = input {
         let contents = if input == Path::new("-") {

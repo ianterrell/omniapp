@@ -82,11 +82,18 @@ The server performs one complete cache build at startup, then a recursive filesy
 - Updated keys retain inline comments while their value representation is regenerated.
 - Unknown fields continue to round-trip without becoming part of the model.
 
-### Phase 6: next implementation
+### Phase 6: relationship services — implemented
 
-1. Add relationship traversal/backreference services and generated-output resolution.
+- Reference fields resolve to complete outbound record links.
+- Inbound backreferences are derived across every model without duplicating them in project files.
+- Referenced target fields must be unique, preventing ambiguous graph edges.
+- Traversal is available through the Rust core, `omniapp relationships`, HTTP, and the record editor.
+
+### Phase 7: next implementation
+
+1. Add generated-output resolution.
 2. Serve configured filesystem assets with schema-driven media previews.
-3. Implement specialized tree, board, calendar, gallery, and timeline renderers against the existing view/query contract.
+3. Implement relationship joins in declarative filters and specialized tree, board, calendar, gallery, and timeline renderers.
 4. Embed `sqlite-vec`; define an embedding-provider interface, dimension migration, and background job state.
 5. Add a sandboxed script host with capability grants. Scripts will call application services, never raw filesystem primitives.
 

@@ -133,6 +133,8 @@ Sources:
 
 Validation supports `min`, `max`, `min_length`, `max_length`, `pattern`, and `choices`. Dates use `YYYY-MM-DD`; date-times use RFC 3339.
 
+Reference fields resolve in both directions. For example, a `Scene.book` reference to `Book.slug` appears as an outbound relationship on the scene and an inbound backreference on the book. Values used as relationship targets must be unique within their model. Use `omniapp relationships Scene opening --json` or the record relationships HTTP endpoint to traverse the graph.
+
 Record identity is the string or integer `id` field when present, otherwise the project-relative record file or directory. An explicit stable `id` is recommended when path fields are frequently renamed or other systems retain record URLs.
 
 Every record returned by the core, CLI JSON output, or HTTP API also has a `revision`. Update bodies include that revision, and delete requests pass it as a query parameter. A revision mismatch means project files changed after the caller read them; OmniApp rejects the mutation instead of overwriting those changes.

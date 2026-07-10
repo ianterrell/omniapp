@@ -201,6 +201,13 @@ enum Command {
         #[arg(long, default_value_t = 50)]
         limit: usize,
     },
+    /// Resolve outbound relationships and inbound backreferences.
+    Relationships {
+        model: String,
+        key: String,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -249,6 +256,9 @@ async fn main() -> Result<()> {
             page_size,
         } => commands::query(&path, &view, page, page_size, cli.json),
         Command::Search { query, path, limit } => commands::search(&path, &query, limit, cli.json),
+        Command::Relationships { model, key, path } => {
+            commands::relationships(&path, &model, &key, cli.json)
+        }
     }
 }
 
@@ -350,6 +360,7 @@ omniapp update <Model> <id-or-slug> --set field=value
 omniapp delete <Model> <id-or-slug>
 omniapp query <view>
 omniapp search <query>
+omniapp relationships <Model> <id-or-slug>
 omniapp serve
 ```
 

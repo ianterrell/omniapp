@@ -14,6 +14,7 @@ This repository contains the first working vertical slice of the architecture:
 - atomic filesystem CRUD and safe relationship-aware deletion;
 - SHA-256 record revisions with optimistic concurrency protection;
 - targeted YAML/frontmatter edits that preserve untouched formatting and comments;
+- resolved outbound relationships and inbound backreferences through core, CLI, API, and UI;
 - rebuildable SQLite FTS5 search cache and an embedding-ready cache table;
 - a local-only HTTP API and schema-generated table/form interface;
 - complete CLI record access with human-readable and JSON output.
@@ -46,6 +47,7 @@ omniapp create Book \
 omniapp update Book dune --set status=complete
 omniapp query library --page 1
 omniapp search 'desert OR ecology'
+omniapp relationships Scene opening
 omniapp delete Book dune
 ```
 
