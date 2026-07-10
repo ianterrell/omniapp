@@ -1,11 +1,11 @@
-# Architecture and implementation plan
+# Architecture, implementation status, and roadmap
 
 ## Non-negotiable invariants
 
 1. Project files are canonical. No application behavior may require the cache to recover a record.
 2. `.omniapp/` describes the project; record and generated content live outside it.
 3. All writes pass through the core service so path safety, validation, references, and indexes stay consistent.
-4. Serialized definitions are versioned and reject unknown keys. Format changes require explicit compatibility or migration behavior.
+4. Serialized definitions are versioned and reject unknown keys. Until the project format is declared stable, format changes may be intentionally breaking; after that declaration they require explicit compatibility or migration behavior.
 5. The web server binds to loopback by default. A future remote mode needs an explicit trust and authentication design.
 
 ## Crate boundaries
@@ -13,8 +13,8 @@
 | Crate | Owns | Must not own |
 |---|---|---|
 | `omniapp-schema` | Serializable project/model/view types and definition validation | Filesystem access beyond reading a definition |
-| `omniapp-core` | Workspace discovery, record codecs, CRUD, reference resolution, queries, validation, caches | HTTP or terminal presentation |
-| `omniapp-web` | Loopback HTTP API and generated UI | Direct project-file writes |
+| `omniapp-core` | Workspace discovery, record codecs, CRUD, revisions, watcher, reference/output resolution, queries, validation, caches | HTTP or terminal presentation |
+| `omniapp-web` | Loopback HTTP API, guarded asset delivery, and generated UI | Direct project-file writes |
 | `omniapp-cli` | Command parsing, initialization, process lifecycle | Record parsing or business invariants |
 
 This direction lets future desktop shells, language bindings, and background services reuse the same core API.
@@ -33,6 +33,9 @@ models + project files
           +------> atomic project-file writes
           |
           `------> disposable SQLite (records, FTS5, embeddings)
+                         ^
+                         |
+              debounced filesystem watcher
 ```
 
 The server performs one complete cache build at startup, then a recursive filesystem watcher batches changes and refreshes only affected record locations. Model, view, or project configuration changes intentionally trigger a complete rebuild. Web listings and saved-view queries execute against cached JSON through SQLite JSON functions; FTS queries use the incrementally maintained FTS5 table. CLI reads remain filesystem-direct so one-shot commands always observe canonical state.
@@ -62,10 +65,11 @@ The server performs one complete cache build at startup, then a recursive filesy
 
 ### Phase 3: initial product surfaces — implemented
 
-- `omniapp init`, `validate`, `serve`, `list`, `get`, `create`, `update`, `delete`, `query`, and `search`.
+- `omniapp init`, `validate`, `serve`, `list`, `get`, `create`, `update`, `delete`, `query`, `search`, `relationships`, and `outputs`.
 - Human-readable terminal output and stable JSON-shaped output for automation.
+- Agent-first initialization that creates or safely extends a root `AGENTS.md`.
 - Port probing from 7777 and automatic browser opening.
-- Project/model/view/record/search HTTP endpoints.
+- Project/model/view/record/search/relationship/output HTTP endpoints plus guarded asset files.
 - Schema-driven table display and generated create/edit/delete forms.
 
 ### Phase 4: optimistic concurrency — implemented
@@ -103,11 +107,30 @@ The server performs one complete cache build at startup, then a recursive filesy
 - A guarded loopback route serves configured assets only, rejects `.omniapp` and symlink escapes, and supports HTTP byte ranges.
 - The generated UI renders lazy image thumbnails, video/audio players, and links for other file types.
 
-### Phase 9: next implementation
+## Remaining roadmap
 
-1. Implement relationship joins in declarative filters and specialized tree, board, calendar, gallery, and timeline renderers.
-2. Embed `sqlite-vec`; define an embedding-provider interface, dimension migration, and background job state.
-3. Add a sandboxed script host with capability grants. Scripts will call application services, never raw filesystem primitives.
+### Production hardening
+
+1. Add a crash-recoverable journal for writes that touch several files or move a directory and then rewrite its contents.
+2. Add inter-process record locks so two CLI/server processes cannot pass revision checks and write concurrently.
+3. Reconcile watcher state after event overflows, watcher errors, sleep/wake, and filesystems that need polling rather than native notifications.
+4. Extend canonical-path and symlink containment checks from served assets to every configured record source and generated-output destination.
+5. Add HTTP integration tests, watcher recovery tests, multi-process conflict tests, malformed-YAML preservation fixtures, and Windows/Linux CI.
+6. Benchmark large workspaces and add optional expression indexes for fields frequently used by saved queries.
+
+### Product and extension work
+
+1. Add relationship traversal and backreference joins to declarative query filters, grouping, and ordering.
+2. Implement specialized tree, board, calendar, gallery, and timeline renderers; the current browser surface is table/form based.
+3. Add real Markdown rendering/preview alongside editing, plus search result excerpts and highlighting.
+4. Embed `sqlite-vec`; define an embedding-provider interface, dimension changes, background indexing, and fully rebuildable semantic search.
+5. Add a sandboxed script host and event hooks. Scripts must call application services rather than edit canonical files directly.
+6. Add publishing/build commands that execute pipelines using resolved output destinations; output path discovery alone is implemented today.
+7. Add optional derived thumbnails/posters for very large media. Current previews stream original files and size them in the browser.
+8. Declare a stable project format when appropriate, then add migrations and a compatibility corpus.
+9. Add packaging, installers, shell completions, CI, and signed release automation.
+
+Remote serving remains out of scope. If introduced, it requires authentication, authorization, CSRF protection, and a different asset trust model; loopback-only assumptions must not silently carry over.
 
 ## Scripting boundary
 
