@@ -1,0 +1,296 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, bail};
+use clap::{Parser, Subcommand};
+use omniapp_core::Workspace;
+use tracing_subscriber::EnvFilter;
+
+const DEFAULT_MODEL: &str = r#"# Model fields may be stored in a path, a shared YAML file, Markdown, or an asset.
+version: 1
+name: Book
+label: Books
+description: A collection of books stored as readable folders.
+storage:
+  path: books/{slug}
+fields:
+  slug:
+    type: string
+    label: Slug
+    required: true
+    source:
+      kind: path
+      variable: slug
+    validation:
+      pattern: "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+  title:
+    type: string
+    label: Title
+    required: true
+    source:
+      kind: yaml
+      file: book.yml
+      key: title
+  author:
+    type: string
+    label: Author
+    source:
+      kind: yaml
+      file: book.yml
+      key: author
+  status:
+    type: enum
+    label: Status
+    default: planned
+    source:
+      kind: yaml
+      file: book.yml
+      key: status
+    validation:
+      choices: [planned, reading, complete]
+  published_on:
+    type: date
+    label: Published
+    source:
+      kind: yaml
+      file: book.yml
+      key: published_on
+  notes:
+    type: text
+    label: Notes
+    source:
+      kind: markdown
+      file: notes.md
+  cover:
+    type: asset
+    label: Cover
+    source:
+      kind: asset
+      file: cover.jpg
+outputs:
+  publication: build/{slug}
+"#;
+
+const DEFAULT_VIEW: &str = r"version: 1
+name: library
+label: Library
+model: Book
+type: table
+fields: [title, author, status, published_on]
+query:
+  order:
+    - field: title
+      direction: asc
+  page_size: 50
+actions: []
+";
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "omniapp",
+    version,
+    about = "A local-first platform for structured data"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Initialize a new project.
+    Init {
+        /// Project directory (defaults to the current directory).
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Display name written to config.yml.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Validate schemas, records, and references.
+    Validate {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Emit the complete validation report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Start the local web application.
+    Serve {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// First port to try. OmniApp increments until one is available.
+        #[arg(long, default_value_t = 7777)]
+        port: u16,
+        /// Do not open the default browser.
+        #[arg(long)]
+        no_open: bool,
+    },
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("omniapp=info")),
+        )
+        .with_target(false)
+        .compact()
+        .init();
+    match Cli::parse().command {
+        Command::Init { path, name } => initialize(&path, name.as_deref()),
+        Command::Validate { path, json } => validate(&path, json),
+        Command::Serve {
+            path,
+            port,
+            no_open,
+        } => serve(path, port, no_open).await,
+    }
+}
+
+fn initialize(path: &Path, requested_name: Option<&str>) -> Result<()> {
+    fs::create_dir_all(path).with_context(|| format!("could not create {}", path.display()))?;
+    let metadata = path.join(".omniapp");
+    if metadata.exists() {
+        bail!(
+            "{} already exists; refusing to overwrite this project",
+            metadata.display()
+        );
+    }
+    fs::create_dir_all(metadata.join("models"))?;
+    fs::create_dir_all(metadata.join("views"))?;
+    fs::create_dir_all(metadata.join("scripts"))?;
+    let inferred_name = path
+        .canonicalize()
+        .ok()
+        .and_then(|value| {
+            value
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "OmniApp Project".to_owned());
+    let name = requested_name.unwrap_or(&inferred_name);
+    let quoted_name = serde_json::to_string(name)?;
+    fs::write(
+        metadata.join("config.yml"),
+        format!("version: 1\nname: {quoted_name}\ndescription: A local-first OmniApp project.\n"),
+    )?;
+    fs::write(metadata.join("models/book.yml"), DEFAULT_MODEL)?;
+    fs::write(metadata.join("views/library.yml"), DEFAULT_VIEW)?;
+    fs::write(
+        metadata.join("scripts/README.md"),
+        "# Project scripts\n\nExecutable project automation will live here. Scripts should use the OmniApp API instead of editing record files directly.\n",
+    )?;
+    update_gitignore(path)?;
+    println!("Initialized OmniApp project in {}", path.display());
+    println!("Next: omniapp validate {}", path.display());
+    Ok(())
+}
+
+fn update_gitignore(root: &Path) -> Result<()> {
+    let path = root.join(".gitignore");
+    let mut contents = if path.exists() {
+        fs::read_to_string(&path)?
+    } else {
+        String::new()
+    };
+    let entries = [
+        ".omniapp/cache.sqlite3",
+        ".omniapp/cache.sqlite3-shm",
+        ".omniapp/cache.sqlite3-wal",
+    ];
+    if !contents.is_empty() && !contents.ends_with('\n') {
+        contents.push('\n');
+    }
+    for entry in entries {
+        if !contents.lines().any(|line| line.trim() == entry) {
+            contents.push_str(entry);
+            contents.push('\n');
+        }
+    }
+    fs::write(path, contents)?;
+    Ok(())
+}
+
+fn validate(path: &Path, json: bool) -> Result<()> {
+    let workspace = Workspace::new(path);
+    let report = workspace.validate()?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        for diagnostic in &report.diagnostics {
+            println!(
+                "{:?}: {}: {}",
+                diagnostic.severity, diagnostic.location, diagnostic.message
+            );
+        }
+        if report.is_valid() {
+            println!(
+                "Valid: {} model(s), {} view(s), {} record(s)",
+                report.models, report.views, report.records
+            );
+        }
+    }
+    if !report.is_valid() {
+        bail!(
+            "validation failed with {} problem(s)",
+            report.diagnostics.len()
+        );
+    }
+    Ok(())
+}
+
+async fn serve(path: PathBuf, port: u16, no_open: bool) -> Result<()> {
+    let workspace = Workspace::new(path);
+    let report = workspace.validate()?;
+    if !report.is_valid() {
+        for diagnostic in &report.diagnostics {
+            eprintln!(
+                "{:?}: {}: {}",
+                diagnostic.severity, diagnostic.location, diagnostic.message
+            );
+        }
+        bail!("project validation failed; fix the reported problems before serving");
+    }
+    let indexed = workspace.rebuild_cache()?;
+    let listener = omniapp_web::bind_available(port).await?;
+    let address = listener.local_addr()?;
+    let url = format!("http://{address}");
+    println!("OmniApp is running at {url} ({indexed} record(s) indexed)");
+    if !no_open && let Err(error) = open::that(&url) {
+        eprintln!("Could not open the default browser: {error}");
+    }
+    omniapp_web::serve(workspace, listener).await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[test]
+    fn initialized_project_is_valid_and_gitignore_is_preserved() {
+        let directory = tempdir().unwrap();
+        fs::write(directory.path().join(".gitignore"), "dist/\n").unwrap();
+        initialize(directory.path(), Some("Test Library")).unwrap();
+
+        let report = Workspace::new(directory.path()).validate().unwrap();
+        assert!(report.is_valid());
+        assert_eq!(report.models, 1);
+        assert_eq!(report.views, 1);
+
+        let ignore = fs::read_to_string(directory.path().join(".gitignore")).unwrap();
+        assert!(ignore.starts_with("dist/\n"));
+        assert!(ignore.contains(".omniapp/cache.sqlite3\n"));
+    }
+
+    #[test]
+    fn initialization_refuses_to_overwrite_metadata() {
+        let directory = tempdir().unwrap();
+        initialize(directory.path(), None).unwrap();
+        assert!(initialize(directory.path(), None).is_err());
+    }
+}
