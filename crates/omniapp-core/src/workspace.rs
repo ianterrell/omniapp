@@ -4,8 +4,8 @@ use std::path::{Component, Path, PathBuf};
 
 use chrono::{DateTime, NaiveDate};
 use omniapp_schema::{
-    Field, FieldSource, FieldType, Model, Problem, ProjectConfig, Storage, View, read_yaml,
-    validate_config, validate_model, validate_view,
+    Field, FieldSource, FieldType, Model, Problem, ProjectConfig, Storage, View, is_safe_relative,
+    read_yaml, validate_config, validate_model, validate_view,
 };
 use regex::Regex;
 use serde::Serialize;
@@ -255,6 +255,41 @@ impl Workspace {
             });
         }
         Ok(OutputSet { record, outputs })
+    }
+
+    pub fn is_known_asset(&self, path: &Path) -> Result<bool, WorkspaceError> {
+        if path.is_absolute()
+            || path.starts_with(".omniapp")
+            || path
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Ok(false);
+        }
+        let loaded = self.load()?;
+        for model in loaded.models.values() {
+            let asset_fields = model
+                .fields
+                .iter()
+                .filter(|(_, field)| field.field_type == FieldType::Asset)
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>();
+            if asset_fields.is_empty() {
+                continue;
+            }
+            for record in self.records(model)? {
+                if asset_fields.iter().any(|field| {
+                    record
+                        .values
+                        .get(*field)
+                        .and_then(Value::as_str)
+                        .is_some_and(|asset| Path::new(asset) == path)
+                }) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     pub fn validate(&self) -> Result<ValidationReport, WorkspaceError> {
@@ -1158,6 +1193,16 @@ fn validate_value(field: &Field, value: &Value, location: &str, diagnostics: &mu
         ));
         return;
     }
+    if field.field_type == FieldType::Asset
+        && value
+            .as_str()
+            .is_some_and(|path| !is_safe_relative(path) || Path::new(path).starts_with(".omniapp"))
+    {
+        diagnostics.push(Diagnostic::error(
+            location,
+            "asset path must be a safe project-relative path outside .omniapp",
+        ));
+    }
     if !field.validation.choices.is_empty() && !field.validation.choices.contains(value) {
         diagnostics.push(Diagnostic::error(
             location,
@@ -1408,6 +1453,16 @@ mod tests {
                         },
                     ),
                 ),
+                (
+                    "cover".into(),
+                    field(
+                        FieldType::Asset,
+                        false,
+                        FieldSource::Asset {
+                            file: "cover.jpg".into(),
+                        },
+                    ),
+                ),
             ]),
             outputs: BTreeMap::from([(
                 "publication".into(),
@@ -1433,6 +1488,25 @@ mod tests {
             )
             .unwrap();
         assert_eq!(record.values["title"], "Dune");
+        fs::write(
+            directory.path().join("books/dune/cover.jpg"),
+            b"large asset bytes",
+        )
+        .unwrap();
+        assert!(
+            workspace
+                .is_known_asset(Path::new("books/dune/cover.jpg"))
+                .unwrap()
+        );
+        assert!(
+            !workspace
+                .is_known_asset(Path::new(".omniapp/config.yml"))
+                .unwrap()
+        );
+        assert_eq!(
+            workspace.records(&model).unwrap()[0].revision,
+            record.revision
+        );
         let outputs = workspace.outputs("Book", &record.key).unwrap();
         assert_eq!(
             outputs.outputs[0].path,

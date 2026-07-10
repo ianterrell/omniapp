@@ -131,6 +131,8 @@ Sources:
 - `markdown`: the UTF-8 Markdown body after any frontmatter;
 - `asset`: the project-relative path to a fixed-name file when that file exists.
 
+Assets remain normal project files and are never copied into SQLite. Directory records can use an `asset` source with a configured filename; frontmatter can also hold a project-relative path in a field whose type is `asset`. Paths must stay inside the project and outside `.omniapp`. The local web application serves only paths currently referenced by asset fields, with byte-range support for large video and audio files.
+
 Validation supports `min`, `max`, `min_length`, `max_length`, `pattern`, and `choices`. Dates use `YYYY-MM-DD`; date-times use RFC 3339.
 
 Reference fields resolve in both directions. For example, a `Scene.book` reference to `Book.slug` appears as an outbound relationship on the scene and an inbound backreference on the book. Values used as relationship targets must be unique within their model. Use `omniapp relationships Scene opening --json` or the record relationships HTTP endpoint to traverse the graph.

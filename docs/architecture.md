@@ -96,12 +96,18 @@ The server performs one complete cache build at startup, then a recursive filesy
 - The Rust core, `omniapp outputs`, HTTP, and record editor share the same output result.
 - OmniApp resolves destinations but does not claim generated artifacts as canonical record data.
 
-### Phase 8: next implementation
+### Phase 8: filesystem asset delivery — implemented
 
-1. Serve configured filesystem assets with schema-driven media previews.
-2. Implement relationship joins in declarative filters and specialized tree, board, calendar, gallery, and timeline renderers.
-3. Embed `sqlite-vec`; define an embedding-provider interface, dimension migration, and background job state.
-4. Add a sandboxed script host with capability grants. Scripts will call application services, never raw filesystem primitives.
+- Large assets are placed and versioned outside OmniApp using normal filesystem tools.
+- Asset fields index only safe project-relative paths; SQLite never stores asset bytes.
+- A guarded loopback route serves configured assets only, rejects `.omniapp` and symlink escapes, and supports HTTP byte ranges.
+- The generated UI renders lazy image thumbnails, video/audio players, and links for other file types.
+
+### Phase 9: next implementation
+
+1. Implement relationship joins in declarative filters and specialized tree, board, calendar, gallery, and timeline renderers.
+2. Embed `sqlite-vec`; define an embedding-provider interface, dimension migration, and background job state.
+3. Add a sandboxed script host with capability grants. Scripts will call application services, never raw filesystem primitives.
 
 ## Scripting boundary
 

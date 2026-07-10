@@ -2,7 +2,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, put};
@@ -12,6 +12,7 @@ use omniapp_schema::Query as RecordQuery;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
+use tower_http::services::ServeFile;
 use tower_http::trace::TraceLayer;
 
 const INDEX: &str = include_str!("index.html");
@@ -70,6 +71,7 @@ pub fn router(workspace: Workspace) -> Router {
         .route("/api/models/{model}/record/outputs", get(record_outputs))
         .route("/api/views/{view}/records", get(view_records))
         .route("/api/search", get(search))
+        .route("/files/{*path}", get(project_asset))
         .layer(TraceLayer::new_for_http())
         .with_state(AppState { workspace })
 }
@@ -218,6 +220,34 @@ async fn search(
     Ok(Json(serde_json::to_value(
         cache.search(&params.q, params.limit.clamp(1, 500))?,
     )?))
+}
+
+async fn project_asset(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    let relative = std::path::Path::new(&path);
+    if !state.workspace.is_known_asset(relative)? {
+        return Err(ApiError::not_found("unknown project asset"));
+    }
+    let root = std::fs::canonicalize(state.workspace.root()).map_err(|error| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: error.to_string(),
+    })?;
+    let absolute = std::fs::canonicalize(state.workspace.root().join(relative))
+        .map_err(|_| ApiError::not_found("asset file does not exist"))?;
+    if !absolute.starts_with(&root) || !absolute.is_file() {
+        return Err(ApiError::not_found("asset path is not a project file"));
+    }
+    let response = ServeFile::new(absolute)
+        .try_call(request)
+        .await
+        .map_err(|error| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: error.to_string(),
+        })?;
+    Ok(response.into_response())
 }
 
 #[derive(Debug)]
