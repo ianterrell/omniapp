@@ -172,6 +172,65 @@ impl Workspace {
         Ok(records.len())
     }
 
+    pub fn refresh_cache_paths(&self, paths: &[PathBuf]) -> Result<usize, WorkspaceError> {
+        let loaded = self.load()?;
+        if paths
+            .iter()
+            .any(|path| definitions_changed(&self.root, path))
+        {
+            return self.rebuild_cache();
+        }
+        let mut affected = BTreeSet::new();
+        for path in paths {
+            let absolute = if path.is_absolute() {
+                path.clone()
+            } else {
+                self.root.join(path)
+            };
+            let Ok(relative) = absolute.strip_prefix(&self.root) else {
+                continue;
+            };
+            if is_cache_path(relative) {
+                continue;
+            }
+            for model in loaded.models.values() {
+                let depth = model.storage.path().split('/').count();
+                let candidate = match &model.storage {
+                    Storage::File { .. } => relative.to_path_buf(),
+                    Storage::Directory { .. } => relative.components().take(depth).collect(),
+                };
+                if match_storage_path(model.storage.path(), &candidate).is_some() {
+                    affected.insert((model.name.clone(), candidate));
+                }
+            }
+        }
+
+        let mut cache = Cache::open(&self.metadata_dir().join("cache.sqlite3"))?;
+        for (model_name, relative) in &affected {
+            let model = loaded
+                .models
+                .get(model_name)
+                .ok_or_else(|| WorkspaceError::UnknownModel(model_name.clone()))?;
+            cache.remove_path(model_name, relative)?;
+            let location = self.root.join(relative);
+            let exists = match &model.storage {
+                Storage::Directory { .. } => location.is_dir(),
+                Storage::File { .. } => location.is_file(),
+            };
+            if exists {
+                let captures =
+                    match_storage_path(model.storage.path(), relative).ok_or_else(|| {
+                        WorkspaceError::Invalid(
+                            "affected record no longer matches its model".into(),
+                        )
+                    })?;
+                let record = self.read_record(model, &location, &captures)?;
+                cache.upsert(&record)?;
+            }
+        }
+        Ok(affected.len())
+    }
+
     pub fn save_record(
         &self,
         model_name: &str,
@@ -302,7 +361,13 @@ impl Workspace {
             match_storage_path(model.storage.path(), &target_relative).ok_or_else(|| {
                 WorkspaceError::Invalid("rendered storage path did not match model".into())
             })?;
-        self.read_record(model, &target, &captures)
+        let record = self.read_record(model, &target, &captures)?;
+        let mut cache = Cache::open(&self.metadata_dir().join("cache.sqlite3"))?;
+        if let Some(existing) = &existing {
+            cache.remove_path(model_name, &existing.path)?;
+        }
+        cache.upsert(&record)?;
+        Ok(record)
     }
 
     pub fn delete_record(&self, model_name: &str, key: &str) -> Result<(), WorkspaceError> {
@@ -364,13 +429,18 @@ impl Workspace {
                 }
             }
         }
-        let path = self.root.join(record.path);
+        let path = self.root.join(&record.path);
         match &model.storage {
             Storage::Directory { .. } => {
-                fs::remove_dir_all(&path).map_err(|source| io_error(path, source))
+                fs::remove_dir_all(&path).map_err(|source| io_error(&path, source))?;
             }
-            Storage::File { .. } => fs::remove_file(&path).map_err(|source| io_error(path, source)),
+            Storage::File { .. } => {
+                fs::remove_file(&path).map_err(|source| io_error(&path, source))?;
+            }
         }
+        let mut cache = Cache::open(&self.metadata_dir().join("cache.sqlite3"))?;
+        cache.remove_path(model_name, &record.path)?;
+        Ok(())
     }
 
     fn read_record(
@@ -988,6 +1058,28 @@ fn io_error(path: impl AsRef<Path>, source: std::io::Error) -> WorkspaceError {
     }
 }
 
+fn definitions_changed(root: &Path, path: &Path) -> bool {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    let Ok(relative) = absolute.strip_prefix(root) else {
+        return false;
+    };
+    relative == Path::new(".omniapp/config.yml")
+        || relative.starts_with(".omniapp/models")
+        || relative.starts_with(".omniapp/views")
+}
+
+fn is_cache_path(relative: &Path) -> bool {
+    relative
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("cache.sqlite3"))
+        && relative.starts_with(".omniapp")
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -1085,6 +1177,14 @@ mod tests {
             fs::read_to_string(directory.path().join("books/dune/README.md")).unwrap(),
             "# Dune\n"
         );
+        let yaml_path = directory.path().join("books/dune/book.yml");
+        fs::write(&yaml_path, "title: Dune Messiah\n").unwrap();
+        assert_eq!(workspace.refresh_cache_paths(&[yaml_path]).unwrap(), 1);
+        let cache = Cache::open(&workspace.metadata_dir().join("cache.sqlite3")).unwrap();
+        let cached = cache
+            .query("Book", &omniapp_schema::Query::default(), 1)
+            .unwrap();
+        assert_eq!(cached.records[0].values["title"], "Dune Messiah");
         assert!(workspace.validate().unwrap().is_valid());
     }
 

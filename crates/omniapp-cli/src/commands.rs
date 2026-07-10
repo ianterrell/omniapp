@@ -66,7 +66,6 @@ pub fn create(
     let values = read_values(sets, input)?;
     let workspace = Workspace::new(path);
     let record = workspace.save_record(model_name, None, RecordInput { values })?;
-    workspace.rebuild_cache()?;
     if json {
         print_json(&record)
     } else {
@@ -101,7 +100,6 @@ pub fn update(
     let records = workspace.records(model)?;
     let key = resolve_record(&records, model_name, selector)?.key.clone();
     let record = workspace.save_record(model_name, Some(&key), RecordInput { values })?;
-    workspace.rebuild_cache()?;
     if json {
         print_json(&record)
     } else {
@@ -127,7 +125,6 @@ pub fn delete(path: &Path, model_name: &str, selector: &str, json: bool) -> Resu
     let key = record.key.clone();
     let record_path = record.path.clone();
     workspace.delete_record(model_name, &key)?;
-    workspace.rebuild_cache()?;
     if json {
         print_json(&json!({
             "deleted": true,

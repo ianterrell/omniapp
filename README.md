@@ -8,6 +8,8 @@ This repository contains the first working vertical slice of the architecture:
 - single-file Markdown records such as `posts/{slug}.md` with structured YAML frontmatter;
 - nested storage such as `books/{book}/scenes/{slug}`;
 - declarative views with filters, ordering, and pagination;
+- debounced filesystem watching with incremental cache and FTS updates;
+- cache-backed declarative queries for the local web application;
 - record/schema/reference validation;
 - atomic filesystem CRUD and safe relationship-aware deletion;
 - rebuildable SQLite FTS5 search cache and an embedding-ready cache table;

@@ -7,7 +7,7 @@ use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, put};
 use axum::{Json, Router};
-use omniapp_core::{Cache, RecordInput, Workspace, WorkspaceError, execute_query};
+use omniapp_core::{Cache, RecordInput, Workspace, WorkspaceError, WorkspaceWatcher};
 use omniapp_schema::Query as RecordQuery;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -83,6 +83,7 @@ pub async fn bind_available(starting_port: u16) -> std::io::Result<TcpListener> 
 }
 
 pub async fn serve(workspace: Workspace, listener: TcpListener) -> std::io::Result<()> {
+    let _watcher = WorkspaceWatcher::start(workspace.clone()).map_err(std::io::Error::other)?;
     axum::serve(listener, router(workspace)).await
 }
 
@@ -109,16 +110,16 @@ async fn model_records(
         .models
         .get(&model_name)
         .ok_or_else(|| WorkspaceError::UnknownModel(model_name.clone()))?;
-    let records = state.workspace.records(model)?;
     let query = RecordQuery {
         page_size: params.page_size.unwrap_or(50),
         ..RecordQuery::default()
     };
-    Ok(Json(serde_json::to_value(execute_query(
-        &records,
+    let cache = Cache::open(&state.workspace.metadata_dir().join("cache.sqlite3"))?;
+    Ok(Json(serde_json::to_value(cache.query(
+        &model.name,
         &query,
         params.page,
-    ))?))
+    )?)?))
 }
 
 async fn view_records(
@@ -135,16 +136,16 @@ async fn view_records(
         .models
         .get(&view.model)
         .ok_or_else(|| WorkspaceError::UnknownModel(view.model.clone()))?;
-    let records = state.workspace.records(model)?;
     let mut query = view.query.clone();
     if let Some(page_size) = params.page_size {
         query.page_size = page_size;
     }
-    Ok(Json(serde_json::to_value(execute_query(
-        &records,
+    let cache = Cache::open(&state.workspace.metadata_dir().join("cache.sqlite3"))?;
+    Ok(Json(serde_json::to_value(cache.query(
+        &model.name,
         &query,
         params.page,
-    ))?))
+    )?)?))
 }
 
 async fn create_record(
@@ -153,7 +154,6 @@ async fn create_record(
     Json(input): Json<RecordInput>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let record = state.workspace.save_record(&model, None, input)?;
-    state.workspace.rebuild_cache()?;
     Ok((StatusCode::CREATED, Json(serde_json::to_value(record)?)))
 }
 
@@ -166,7 +166,6 @@ async fn update_record(
     let record = state
         .workspace
         .save_record(&model, Some(&params.key), input)?;
-    state.workspace.rebuild_cache()?;
     Ok(Json(serde_json::to_value(record)?))
 }
 
@@ -176,7 +175,6 @@ async fn delete_record(
     Query(params): Query<KeyParams>,
 ) -> Result<StatusCode, ApiError> {
     state.workspace.delete_record(&model, &params.key)?;
-    state.workspace.rebuild_cache()?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -187,9 +185,6 @@ async fn search(
     if params.q.trim().is_empty() {
         return Ok(Json(json!([])));
     }
-    // External editors may have changed files since startup. Rebuilding here keeps
-    // search correct without making SQLite authoritative; a watcher can optimize this later.
-    state.workspace.rebuild_cache()?;
     let cache = Cache::open(&state.workspace.metadata_dir().join("cache.sqlite3"))?;
     Ok(Json(serde_json::to_value(
         cache.search(&params.q, params.limit.clamp(1, 500))?,

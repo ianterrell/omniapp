@@ -4,9 +4,11 @@ mod cache;
 mod document;
 mod query;
 mod record;
+mod watcher;
 mod workspace;
 
 pub use cache::{Cache, CacheError, SearchHit};
 pub use query::{Page, execute_query};
 pub use record::{Record, RecordInput};
+pub use watcher::{WatcherError, WorkspaceWatcher};
 pub use workspace::{Diagnostic, LoadedWorkspace, ValidationReport, Workspace, WorkspaceError};

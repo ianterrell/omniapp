@@ -35,7 +35,7 @@ models + project files
           `------> disposable SQLite (records, FTS5, embeddings)
 ```
 
-The server rereads records for requests. Search rebuilds before querying so edits made in an external editor are visible even before a filesystem watcher is introduced. This favors correctness in the initial release; watcher-driven incremental indexing is the planned optimization.
+The server performs one complete cache build at startup, then a recursive filesystem watcher batches changes and refreshes only affected record locations. Model, view, or project configuration changes intentionally trigger a complete rebuild. Web listings and saved-view queries execute against cached JSON through SQLite JSON functions; FTS queries use the incrementally maintained FTS5 table. CLI reads remain filesystem-direct so one-shot commands always observe canonical state.
 
 ## Delivered phases
 
@@ -49,11 +49,13 @@ The server rereads records for requests. Search rebuilds before querying so edit
 - Type, required, range, length, regex, enum, duplicate-key, and relationship validation.
 - Atomic writes, path-field file/directory moves, and guarded deletes.
 
-### Phase 2: query and cache — implemented foundation
+### Phase 2: query, watcher, and cache — implemented
 
 - Declarative `eq`, `not_eq`, comparison, containment, membership, and null filters.
 - Multi-field ascending/descending ordering and pagination.
 - Rebuildable SQLite record cache and FTS5 index.
+- Debounced recursive filesystem watcher with per-record upsert/removal.
+- SQLite-backed declarative filtering, ordering, null handling, and pagination.
 - An embedding table whose contents are explicitly rebuildable.
 
 `sqlite-vec` virtual tables and embedding providers remain pending because dimension/model lifecycle and extension packaging need a stable contract first.
@@ -68,13 +70,13 @@ The server rereads records for requests. Search rebuilds before querying so edit
 
 ### Phase 4: next implementation
 
-1. Add a debounced filesystem watcher and incremental cache transactions.
-2. Add optimistic concurrency using file fingerprints so external edits cannot be silently overwritten by a stale form.
-3. Add asset upload/rename APIs and codecs for richer media metadata.
-4. Implement specialized tree, board, calendar, gallery, and timeline renderers against the existing view/query contract.
-5. Embed `sqlite-vec`; define an embedding-provider interface, dimension migration, and background job state.
-6. Add a sandboxed script host with capability grants. Scripts will call application services, never raw filesystem primitives.
-7. Add format migrations and a compatibility test corpus before releasing format version 2.
+1. Add optimistic concurrency using file fingerprints so external edits cannot be silently overwritten by a stale form.
+2. Preserve comments and formatting when configured YAML/frontmatter keys change.
+3. Add relationship traversal/backreference services and generated-output resolution.
+4. Serve configured filesystem assets with schema-driven media previews.
+5. Implement specialized tree, board, calendar, gallery, and timeline renderers against the existing view/query contract.
+6. Embed `sqlite-vec`; define an embedding-provider interface, dimension migration, and background job state.
+7. Add a sandboxed script host with capability grants. Scripts will call application services, never raw filesystem primitives.
 
 ## Scripting boundary
 
