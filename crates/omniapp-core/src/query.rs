@@ -19,6 +19,23 @@ pub struct Page {
 pub fn execute_query(records: &[Record], query: &Query, page: usize) -> Page {
     let page = page.max(1);
     let page_size = query.page_size.clamp(1, 1000);
+    let matches = execute_query_all(records, query);
+    let total = matches.len();
+    let pages = total.div_ceil(page_size);
+    let start = (page - 1).saturating_mul(page_size).min(total);
+    let end = start.saturating_add(page_size).min(total);
+    Page {
+        records: matches[start..end].to_vec(),
+        page,
+        page_size,
+        total,
+        pages,
+    }
+}
+
+/// Apply a query's filters and order without pagination.
+#[must_use]
+pub fn execute_query_all(records: &[Record], query: &Query) -> Vec<Record> {
     let mut matches: Vec<Record> = records
         .iter()
         .filter(|record| {
@@ -46,18 +63,7 @@ pub fn execute_query(records: &[Record], query: &Query, page: usize) -> Page {
         }
         left.key.cmp(&right.key)
     });
-
-    let total = matches.len();
-    let pages = total.div_ceil(page_size);
-    let start = (page - 1).saturating_mul(page_size).min(total);
-    let end = start.saturating_add(page_size).min(total);
-    Page {
-        records: matches[start..end].to_vec(),
-        page,
-        page_size,
-        total,
-        pages,
-    }
+    matches
 }
 
 fn matches_filter(record: &Record, filter: &Filter) -> bool {

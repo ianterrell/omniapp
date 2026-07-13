@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -6,6 +8,9 @@ use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use thiserror::Error;
 
 use crate::Workspace;
+
+/// Called with each debounced batch of changed paths, after the cache refresh.
+pub type WatchObserver = Arc<dyn Fn(&[PathBuf]) + Send + Sync>;
 
 #[derive(Debug, Error)]
 pub enum WatcherError {
@@ -21,6 +26,16 @@ pub struct WorkspaceWatcher {
 
 impl WorkspaceWatcher {
     pub fn start(workspace: Workspace) -> Result<Self, WatcherError> {
+        Self::start_with_observer(workspace, Arc::new(|_| {}))
+    }
+
+    /// Start the watcher and additionally notify `observer` with every
+    /// debounced batch of changed paths (whether or not they affect the
+    /// record cache — e.g. site template edits under `.omniapp/site/`).
+    pub fn start_with_observer(
+        workspace: Workspace,
+        observer: WatchObserver,
+    ) -> Result<Self, WatcherError> {
         let (events_tx, events_rx) = mpsc::channel();
         let (stop_tx, stop_rx) = mpsc::channel();
         let mut watcher = notify::recommended_watcher(move |event: notify::Result<Event>| {
@@ -58,6 +73,7 @@ impl WorkspaceWatcher {
                 if let Err(error) = workspace.refresh_cache_paths(&paths) {
                     eprintln!("OmniApp incremental index update failed: {error}");
                 }
+                observer(&paths);
             }
         });
 

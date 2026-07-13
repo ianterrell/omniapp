@@ -1,12 +1,14 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{LazyLock, RwLock};
 
 use chrono::{DateTime, NaiveDate};
 use omniapp_schema::{
     Field, FieldSource, FieldType, Model, Problem, ProjectConfig, Storage, View, is_safe_relative,
-    read_yaml, validate_config, validate_model, validate_view,
+    read_yaml, validate_config, validate_model, validate_navigation, validate_view,
 };
+use rayon::prelude::*;
 use regex::Regex;
 use serde::Serialize;
 use serde_json::Value;
@@ -46,12 +48,219 @@ pub struct Workspace {
     root: PathBuf,
 }
 
+/// Cache metadata key holding the digest of the model definitions the cached
+/// records were parsed under.
+const MODELS_DIGEST_KEY: &str = "models_digest";
+
+/// Path variables captured from a storage-template match.
+type PathCaptures = BTreeMap<String, String>;
+
+/// Discovered record locations per model name, each sorted by path.
+type DiscoveredLocations = BTreeMap<String, Vec<(PathBuf, PathCaptures)>>;
+
+/// A compiled storage-template segment: the regex and its variable names.
+type SegmentMatcher = Option<(Regex, Vec<String>)>;
+
+/// A digest of the model definitions; cached records parsed under a different
+/// digest are stale regardless of their file fingerprints.
+fn models_digest(models: &BTreeMap<String, Model>) -> String {
+    let mut hasher = Sha256::new();
+    for (name, model) in models {
+        hasher.update(name.as_bytes());
+        hasher.update([0]);
+        hasher.update(serde_json::to_string(model).unwrap_or_default().as_bytes());
+        hasher.update([0]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct LoadedWorkspace {
     pub root: PathBuf,
     pub config: ProjectConfig,
     pub models: BTreeMap<String, Model>,
     pub views: BTreeMap<String, View>,
+}
+
+/// The result of reconciling the cache with the filesystem: the loaded
+/// definitions plus every record, with only changed files re-read from disk.
+#[derive(Debug)]
+pub struct SyncedWorkspace {
+    pub loaded: LoadedWorkspace,
+    pub records: Vec<Record>,
+    /// Records re-read because they were new or their fingerprint changed.
+    pub refreshed: usize,
+    /// Cache rows removed because their source files are gone or unreadable.
+    pub removed: usize,
+    /// Per-record read failures (the record is dropped from the cache).
+    pub problems: Vec<Diagnostic>,
+}
+
+/// An in-memory view of the whole project — definitions plus every record —
+/// for read paths that would otherwise rescan the filesystem per call.
+/// Build one from [`Workspace::sync_cache`] results or cached records and
+/// share it behind an `Arc`; the web server invalidates its copy whenever the
+/// watcher reports a change.
+#[derive(Debug)]
+pub struct RecordsSnapshot {
+    pub loaded: LoadedWorkspace,
+    pub records: Vec<Record>,
+}
+
+impl RecordsSnapshot {
+    /// Resolve a record by canonical key, storage path, or unique `id`/`slug`.
+    pub fn find_record(&self, model_name: &str, selector: &str) -> Result<Record, WorkspaceError> {
+        if !self.loaded.models.contains_key(model_name) {
+            return Err(WorkspaceError::UnknownModel(model_name.to_owned()));
+        }
+        let records = self.model_records(model_name);
+        find_in_records(&records, model_name, selector).map(|record| (*record).clone())
+    }
+
+    /// Outbound references and inbound backreferences for one record.
+    pub fn relationships(
+        &self,
+        model_name: &str,
+        key: &str,
+    ) -> Result<RelationshipSet, WorkspaceError> {
+        let model = self
+            .loaded
+            .models
+            .get(model_name)
+            .ok_or_else(|| WorkspaceError::UnknownModel(model_name.to_owned()))?;
+        let same_model = self.model_records(model_name);
+        let record = (*find_in_records(&same_model, model_name, key)?).clone();
+
+        let mut outbound = Vec::new();
+        for (field_name, field) in &model.fields {
+            let Some(reference) = &field.reference else {
+                continue;
+            };
+            let Some(value) = record.values.get(field_name) else {
+                continue;
+            };
+            let values = relationship_values(value, reference.many);
+            for target in self.records.iter().filter(|candidate| {
+                candidate.model == reference.model
+                    && candidate
+                        .values
+                        .get(&reference.field)
+                        .is_some_and(|value| values.contains(&value))
+            }) {
+                outbound.push(RelationshipLink {
+                    field: field_name.clone(),
+                    target_field: reference.field.clone(),
+                    record: target.clone(),
+                });
+            }
+        }
+
+        let mut inbound = Vec::new();
+        for candidate in &self.records {
+            let Some(candidate_model) = self.loaded.models.get(&candidate.model) else {
+                continue;
+            };
+            for (field_name, field) in &candidate_model.fields {
+                let Some(reference) = &field.reference else {
+                    continue;
+                };
+                if reference.model != record.model {
+                    continue;
+                }
+                let Some(target_value) = record.values.get(&reference.field) else {
+                    continue;
+                };
+                let Some(source_value) = candidate.values.get(field_name) else {
+                    continue;
+                };
+                if relationship_values(source_value, reference.many).contains(&target_value) {
+                    inbound.push(RelationshipLink {
+                        field: field_name.clone(),
+                        target_field: reference.field.clone(),
+                        record: candidate.clone(),
+                    });
+                }
+            }
+        }
+        outbound.sort_by(|left, right| {
+            (&left.field, &left.record.model, &left.record.key).cmp(&(
+                &right.field,
+                &right.record.model,
+                &right.record.key,
+            ))
+        });
+        inbound.sort_by(|left, right| {
+            (&left.record.model, &left.field, &left.record.key).cmp(&(
+                &right.record.model,
+                &right.field,
+                &right.record.key,
+            ))
+        });
+        Ok(RelationshipSet {
+            record,
+            outbound,
+            inbound,
+        })
+    }
+
+    /// Declared generated-output paths for one record, with existence checks
+    /// against the project root.
+    pub fn outputs(&self, model_name: &str, key: &str) -> Result<OutputSet, WorkspaceError> {
+        let model = self
+            .loaded
+            .models
+            .get(model_name)
+            .ok_or_else(|| WorkspaceError::UnknownModel(model_name.to_owned()))?;
+        let records = self.model_records(model_name);
+        let record = (*find_in_records(&records, model_name, key)?).clone();
+        let mut outputs = Vec::new();
+        for (name, template) in &model.outputs {
+            let path = render_path_template(template, &record.values)?;
+            let absolute = self.loaded.root.join(&path);
+            outputs.push(GeneratedOutput {
+                name: name.clone(),
+                path,
+                exists: absolute.exists(),
+                is_file: absolute.is_file(),
+                is_directory: absolute.is_dir(),
+            });
+        }
+        Ok(OutputSet { record, outputs })
+    }
+
+    /// Whether a project-relative path is the value of some record's asset
+    /// field (and therefore safe to serve).
+    #[must_use]
+    pub fn is_known_asset(&self, path: &Path) -> bool {
+        if path.is_absolute()
+            || path.starts_with(".omniapp")
+            || path
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return false;
+        }
+        self.records.iter().any(|record| {
+            let Some(model) = self.loaded.models.get(&record.model) else {
+                return false;
+            };
+            model.fields.iter().any(|(name, field)| {
+                field.field_type == FieldType::Asset
+                    && record
+                        .values
+                        .get(name)
+                        .and_then(Value::as_str)
+                        .is_some_and(|asset| Path::new(asset) == path)
+            })
+        })
+    }
+
+    fn model_records(&self, model_name: &str) -> Vec<&Record> {
+        self.records
+            .iter()
+            .filter(|record| record.model == model_name)
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -102,6 +311,48 @@ impl Workspace {
         self.root.join(".omniapp")
     }
 
+    /// Directory holding one source directory per public site.
+    #[must_use]
+    pub fn sites_dir(&self) -> PathBuf {
+        self.metadata_dir().join("sites")
+    }
+
+    /// Source directory for one named public site.
+    #[must_use]
+    pub fn site_dir(&self, name: &str) -> PathBuf {
+        self.sites_dir().join(name)
+    }
+
+    /// The project's site names: sorted subdirectories of `.omniapp/sites`.
+    /// Names become output directories and printed URLs, so anything outside
+    /// `[a-z0-9-]+` is rejected rather than silently skipped.
+    pub fn site_names(&self) -> Result<Vec<String>, WorkspaceError> {
+        let sites = self.sites_dir();
+        if !sites.is_dir() {
+            return Ok(Vec::new());
+        }
+        let mut names = Vec::new();
+        for entry in fs::read_dir(&sites).map_err(|source| io_error(&sites, source))? {
+            let entry = entry.map_err(|source| io_error(&sites, source))?;
+            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.is_empty()
+                || !name
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            {
+                return Err(WorkspaceError::Invalid(format!(
+                    "site directory name {name:?} is invalid; use lowercase letters, digits, and hyphens"
+                )));
+            }
+            names.push(name);
+        }
+        names.sort();
+        Ok(names)
+    }
+
     pub fn load(&self) -> Result<LoadedWorkspace, WorkspaceError> {
         let metadata = self.metadata_dir();
         if !metadata.is_dir() {
@@ -130,10 +381,31 @@ impl Workspace {
 
     pub fn all_records(&self, loaded: &LoadedWorkspace) -> Result<Vec<Record>, WorkspaceError> {
         let mut records = Vec::new();
-        for model in loaded.models.values() {
-            records.extend(self.records(model)?);
+        for (model_name, locations) in discover_all_record_locations(&self.root, &loaded.models) {
+            let model = &loaded.models[&model_name];
+            for (location, captures) in locations {
+                records.push(self.read_record(model, &location, &captures)?);
+            }
         }
         Ok(records)
+    }
+
+    /// Resolve a record by canonical key, storage path, or a unique `id`/`slug`
+    /// value.
+    pub fn find_record(&self, model_name: &str, selector: &str) -> Result<Record, WorkspaceError> {
+        self.snapshot()?.find_record(model_name, selector)
+    }
+
+    /// Sync the cache and return an in-memory snapshot of the whole project.
+    /// One-shot callers (CLI commands) get correct results after direct file
+    /// edits; long-lived callers should cache the snapshot themselves and
+    /// invalidate on watcher events.
+    pub fn snapshot(&self) -> Result<RecordsSnapshot, WorkspaceError> {
+        let synced = self.sync_cache()?;
+        Ok(RecordsSnapshot {
+            loaded: synced.loaded,
+            records: synced.records,
+        })
     }
 
     pub fn relationships(
@@ -141,217 +413,191 @@ impl Workspace {
         model_name: &str,
         key: &str,
     ) -> Result<RelationshipSet, WorkspaceError> {
-        let loaded = self.load()?;
-        let model = loaded
-            .models
-            .get(model_name)
-            .ok_or_else(|| WorkspaceError::UnknownModel(model_name.to_owned()))?;
-        let records = self.all_records(&loaded)?;
-        let record = records
-            .iter()
-            .find(|record| record.model == model_name && record.key == key)
-            .cloned()
-            .ok_or_else(|| WorkspaceError::UnknownRecord {
-                model: model_name.to_owned(),
-                key: key.to_owned(),
-            })?;
-
-        let mut outbound = Vec::new();
-        for (field_name, field) in &model.fields {
-            let Some(reference) = &field.reference else {
-                continue;
-            };
-            let Some(value) = record.values.get(field_name) else {
-                continue;
-            };
-            let values = relationship_values(value, reference.many);
-            for target in records.iter().filter(|candidate| {
-                candidate.model == reference.model
-                    && candidate
-                        .values
-                        .get(&reference.field)
-                        .is_some_and(|value| values.contains(&value))
-            }) {
-                outbound.push(RelationshipLink {
-                    field: field_name.clone(),
-                    target_field: reference.field.clone(),
-                    record: target.clone(),
-                });
-            }
-        }
-
-        let mut inbound = Vec::new();
-        for candidate in &records {
-            let Some(candidate_model) = loaded.models.get(&candidate.model) else {
-                continue;
-            };
-            for (field_name, field) in &candidate_model.fields {
-                let Some(reference) = &field.reference else {
-                    continue;
-                };
-                if reference.model != record.model {
-                    continue;
-                }
-                let Some(target_value) = record.values.get(&reference.field) else {
-                    continue;
-                };
-                let Some(source_value) = candidate.values.get(field_name) else {
-                    continue;
-                };
-                if relationship_values(source_value, reference.many).contains(&target_value) {
-                    inbound.push(RelationshipLink {
-                        field: field_name.clone(),
-                        target_field: reference.field.clone(),
-                        record: candidate.clone(),
-                    });
-                }
-            }
-        }
-        outbound.sort_by(|left, right| {
-            (&left.field, &left.record.model, &left.record.key).cmp(&(
-                &right.field,
-                &right.record.model,
-                &right.record.key,
-            ))
-        });
-        inbound.sort_by(|left, right| {
-            (&left.record.model, &left.field, &left.record.key).cmp(&(
-                &right.record.model,
-                &right.field,
-                &right.record.key,
-            ))
-        });
-        Ok(RelationshipSet {
-            record,
-            outbound,
-            inbound,
-        })
+        self.snapshot()?.relationships(model_name, key)
     }
 
     pub fn outputs(&self, model_name: &str, key: &str) -> Result<OutputSet, WorkspaceError> {
-        let loaded = self.load()?;
-        let model = loaded
-            .models
-            .get(model_name)
-            .ok_or_else(|| WorkspaceError::UnknownModel(model_name.to_owned()))?;
-        let record = self
-            .records(model)?
-            .into_iter()
-            .find(|record| record.key == key)
-            .ok_or_else(|| WorkspaceError::UnknownRecord {
-                model: model_name.to_owned(),
-                key: key.to_owned(),
-            })?;
-        let mut outputs = Vec::new();
-        for (name, template) in &model.outputs {
-            let path = render_output_path(template, &record.values)?;
-            let absolute = self.root.join(&path);
-            outputs.push(GeneratedOutput {
-                name: name.clone(),
-                path,
-                exists: absolute.exists(),
-                is_file: absolute.is_file(),
-                is_directory: absolute.is_dir(),
-            });
-        }
-        Ok(OutputSet { record, outputs })
+        self.snapshot()?.outputs(model_name, key)
     }
 
     pub fn is_known_asset(&self, path: &Path) -> Result<bool, WorkspaceError> {
-        if path.is_absolute()
-            || path.starts_with(".omniapp")
-            || path
-                .components()
-                .any(|component| !matches!(component, Component::Normal(_)))
-        {
-            return Ok(false);
-        }
-        let loaded = self.load()?;
-        for model in loaded.models.values() {
-            let asset_fields = model
-                .fields
-                .iter()
-                .filter(|(_, field)| field.field_type == FieldType::Asset)
-                .map(|(name, _)| name)
-                .collect::<Vec<_>>();
-            if asset_fields.is_empty() {
-                continue;
-            }
-            for record in self.records(model)? {
-                if asset_fields.iter().any(|field| {
-                    record
-                        .values
-                        .get(*field)
-                        .and_then(Value::as_str)
-                        .is_some_and(|asset| Path::new(asset) == path)
-                }) {
-                    return Ok(true);
-                }
-            }
-        }
-        Ok(false)
+        Ok(self.snapshot()?.is_known_asset(path))
     }
 
+    /// Validate the project after an incremental cache sync: only new or
+    /// changed records are re-read from disk.
     pub fn validate(&self) -> Result<ValidationReport, WorkspaceError> {
-        let loaded = self.load()?;
-        let mut diagnostics = Vec::new();
-        diagnostics.extend(problems_to_diagnostics(validate_config(&loaded.config)));
-        for model in loaded.models.values() {
-            diagnostics.extend(problems_to_diagnostics(validate_model(model)));
-        }
-        for view in loaded.views.values() {
-            diagnostics.extend(problems_to_diagnostics(validate_view(view, &loaded.models)));
-        }
+        let synced = self.sync_cache()?;
+        Ok(self.validate_synced(&synced))
+    }
 
-        let mut all_records = Vec::new();
-        for model in loaded.models.values() {
-            match self.records(model) {
-                Ok(records) => all_records.extend(records),
-                Err(error) => diagnostics.push(Diagnostic::error(
+    /// Validate against an already-synced record set (avoids a second sync
+    /// when the caller needs the records too, e.g. `serve`).
+    #[must_use]
+    pub fn validate_synced(&self, synced: &SyncedWorkspace) -> ValidationReport {
+        validation_report(&synced.loaded, &synced.records, synced.problems.clone())
+    }
+
+    /// Validate every record freshly from disk, rebuilding the cache from the
+    /// scan — the escape hatch when the fingerprint-based cache is suspected
+    /// stale.
+    pub fn validate_full(&self) -> Result<ValidationReport, WorkspaceError> {
+        let loaded = self.load()?;
+        let (pairs, problems) = self.scan_all(&loaded);
+        let mut cache = self.open_cache()?;
+        cache.rebuild(&pairs)?;
+        cache.set_metadata(MODELS_DIGEST_KEY, &models_digest(&loaded.models))?;
+        let records = pairs
+            .into_iter()
+            .map(|(record, _)| record)
+            .collect::<Vec<_>>();
+        Ok(validation_report(&loaded, &records, problems))
+    }
+
+    pub fn rebuild_cache(&self) -> Result<usize, WorkspaceError> {
+        let loaded = self.load()?;
+        let (records, _problems) = self.scan_all(&loaded);
+        let mut cache = self.open_cache()?;
+        cache.rebuild(&records)?;
+        cache.set_metadata(MODELS_DIGEST_KEY, &models_digest(&loaded.models))?;
+        Ok(records.len())
+    }
+
+    /// Read every record freshly from disk in parallel, collecting per-record
+    /// failures instead of aborting the scan.
+    fn scan_all(&self, loaded: &LoadedWorkspace) -> (Vec<(Record, String)>, Vec<Diagnostic>) {
+        let mut work = Vec::new();
+        for (model_name, locations) in discover_all_record_locations(&self.root, &loaded.models) {
+            let model = &loaded.models[&model_name];
+            for (location, captures) in locations {
+                work.push((model, location, captures));
+            }
+        }
+        let results = work
+            .par_iter()
+            .map(|(model, location, captures)| {
+                let fingerprint = record_fingerprint(model, location);
+                self.read_record(model, location, captures)
+                    .map(|record| (record, fingerprint))
+            })
+            .collect::<Vec<_>>();
+        let mut records = Vec::new();
+        let mut problems = Vec::new();
+        for ((model, _, _), result) in work.iter().zip(results) {
+            match result {
+                Ok(pair) => records.push(pair),
+                Err(error) => problems.push(Diagnostic::error(
                     format!("model {}", model.name),
                     error.to_string(),
                 )),
             }
         }
-        validate_records(&loaded.models, &all_records, &mut diagnostics);
-        validate_references(&loaded.models, &all_records, &mut diagnostics);
+        (records, problems)
+    }
 
-        Ok(ValidationReport {
-            models: loaded.models.len(),
-            views: loaded.views.len(),
-            records: all_records.len(),
-            diagnostics,
+    /// Reconcile the cache with the filesystem using stat fingerprints: one
+    /// pruned walk discovers record locations, only new or changed records
+    /// are re-read (in parallel), vanished rows are deleted, and everything
+    /// else is returned straight from the cache. If the model definitions
+    /// changed since the cache was written, every record is re-read.
+    pub fn sync_cache(&self) -> Result<SyncedWorkspace, WorkspaceError> {
+        let loaded = self.load()?;
+        let mut cache = self.open_cache()?;
+        let digest = models_digest(&loaded.models);
+        let definitions_stale = cache.metadata(MODELS_DIGEST_KEY)? != Some(digest.clone());
+        let mut cached = cache.fingerprints()?;
+
+        let mut to_read = Vec::new();
+        for (model_name, locations) in discover_all_record_locations(&self.root, &loaded.models) {
+            let model = &loaded.models[&model_name];
+            for (location, captures) in locations {
+                let Ok(relative) = location.strip_prefix(&self.root) else {
+                    continue;
+                };
+                let relative = relative.to_string_lossy().into_owned();
+                let fingerprint = record_fingerprint(model, &location);
+                let unchanged = cached
+                    .remove(&(model_name.clone(), relative.clone()))
+                    .is_some_and(|previous| previous == fingerprint);
+                if unchanged && !definitions_stale {
+                    continue;
+                }
+                to_read.push((model, location, captures, relative, fingerprint));
+            }
+        }
+        // Rows left in `cached` have no matching file on disk any more.
+        let mut removals: Vec<(String, String)> = cached.into_keys().collect();
+
+        let mut upserts = Vec::new();
+        let mut problems = Vec::new();
+        let results = to_read
+            .par_iter()
+            .map(|(model, location, captures, _, _)| self.read_record(model, location, captures))
+            .collect::<Vec<_>>();
+        for ((model, _, _, relative, fingerprint), result) in to_read.into_iter().zip(results) {
+            match result {
+                Ok(record) => upserts.push((record, fingerprint)),
+                Err(error) => {
+                    problems.push(Diagnostic::error(
+                        format!("model {}", model.name),
+                        error.to_string(),
+                    ));
+                    removals.push((model.name.clone(), relative));
+                }
+            }
+        }
+        let refreshed = upserts.len();
+        let removed = removals.len();
+        cache.apply(&upserts, &removals)?;
+        cache.set_metadata(MODELS_DIGEST_KEY, &digest)?;
+        let records = cache.all_records()?;
+        Ok(SyncedWorkspace {
+            loaded,
+            records,
+            refreshed,
+            removed,
+            problems,
         })
     }
 
-    pub fn rebuild_cache(&self) -> Result<usize, WorkspaceError> {
-        let loaded = self.load()?;
-        let records = self.all_records(&loaded)?;
+    /// Resolve a possibly absolute, possibly canonicalized path to its
+    /// project-relative form, trying both the workspace root as given and its
+    /// canonical form.
+    fn project_relative(&self, path: &Path, canonical_root: Option<&Path>) -> Option<PathBuf> {
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.root.join(path)
+        };
+        if let Ok(relative) = absolute.strip_prefix(&self.root) {
+            return Some(relative.to_path_buf());
+        }
+        canonical_root.and_then(|root| absolute.strip_prefix(root).ok().map(Path::to_path_buf))
+    }
+
+    fn open_cache(&self) -> Result<Cache, WorkspaceError> {
         fs::create_dir_all(self.metadata_dir())
             .map_err(|source| io_error(self.metadata_dir(), source))?;
-        let mut cache = Cache::open(&self.metadata_dir().join("cache.sqlite3"))?;
-        cache.rebuild(&records)?;
-        Ok(records.len())
+        Ok(Cache::open(&self.metadata_dir().join("cache.sqlite3"))?)
     }
 
     pub fn refresh_cache_paths(&self, paths: &[PathBuf]) -> Result<usize, WorkspaceError> {
-        let loaded = self.load()?;
-        if paths
+        // Watcher events carry canonical absolute paths, which need not
+        // textually contain the workspace root (a relative root like `.`, or
+        // a symlinked ancestor such as Dropbox's macOS location), so resolve
+        // against the canonical root too.
+        let canonical_root = fs::canonicalize(&self.root).ok();
+        let relative_paths = paths
             .iter()
-            .any(|path| definitions_changed(&self.root, path))
-        {
+            .filter_map(|path| self.project_relative(path, canonical_root.as_deref()))
+            .collect::<Vec<_>>();
+        if relative_paths.iter().any(|path| is_definition_path(path)) {
             return self.rebuild_cache();
         }
+        let loaded = self.load()?;
         let mut affected = BTreeSet::new();
-        for path in paths {
-            let absolute = if path.is_absolute() {
-                path.clone()
-            } else {
-                self.root.join(path)
-            };
-            let Ok(relative) = absolute.strip_prefix(&self.root) else {
-                continue;
-            };
+        for relative in &relative_paths {
+            let relative = relative.as_path();
             if is_cache_path(relative) {
                 continue;
             }
@@ -367,7 +613,7 @@ impl Workspace {
             }
         }
 
-        let mut cache = Cache::open(&self.metadata_dir().join("cache.sqlite3"))?;
+        let mut cache = self.open_cache()?;
         for (model_name, relative) in &affected {
             let model = loaded
                 .models
@@ -387,7 +633,7 @@ impl Workspace {
                         )
                     })?;
                 let record = self.read_record(model, &location, &captures)?;
-                cache.upsert(&record)?;
+                cache.upsert(&record, &record_fingerprint(model, &location))?;
             }
         }
         Ok(affected.len())
@@ -539,7 +785,7 @@ impl Workspace {
         if let Some(existing) = &existing {
             cache.remove_path(model_name, &existing.path)?;
         }
-        cache.upsert(&record)?;
+        cache.upsert(&record, &record_fingerprint(model, &target))?;
         Ok(record)
     }
 
@@ -638,8 +884,9 @@ impl Workspace {
             .map_err(|_| WorkspaceError::Invalid("record escaped project root".into()))?
             .to_path_buf();
         let mut values = BTreeMap::new();
+        let mut reader = SourceReader::default();
         let mut yaml_documents: HashMap<PathBuf, serde_yaml::Value> = HashMap::new();
-        let mut markdown_documents: HashMap<PathBuf, MarkdownDocument> = HashMap::new();
+        let mut markdown_documents: HashMap<PathBuf, (bool, MarkdownDocument)> = HashMap::new();
 
         for (name, field) in &model.fields {
             let value = match &field.source {
@@ -649,17 +896,14 @@ impl Workspace {
                 FieldSource::Yaml { file, key } => {
                     let path = source_path(model, location, Some(file))?;
                     if !yaml_documents.contains_key(&path) {
-                        let document = if path.exists() {
-                            let contents = fs::read_to_string(&path)
-                                .map_err(|source| io_error(&path, source))?;
-                            serde_yaml::from_str(&contents).map_err(|error| {
+                        let document = match reader.read_str(&path)? {
+                            Some(contents) => serde_yaml::from_str(contents).map_err(|error| {
                                 WorkspaceError::Invalid(format!(
                                     "could not parse {}: {error}",
                                     path.display()
                                 ))
-                            })?
-                        } else {
-                            serde_yaml::Value::Mapping(serde_yaml::Mapping::new())
+                            })?,
+                            None => serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
                         };
                         yaml_documents.insert(path.clone(), document);
                     }
@@ -672,26 +916,29 @@ impl Workspace {
                 FieldSource::Markdown { file } => {
                     let path = source_path(model, location, file.as_deref())?;
                     if !markdown_documents.contains_key(&path) {
-                        markdown_documents.insert(path.clone(), MarkdownDocument::read(&path)?);
+                        let entry = match reader.read_str(&path)? {
+                            Some(contents) => (true, MarkdownDocument::parse(contents, &path)?),
+                            None => (false, MarkdownDocument::default()),
+                        };
+                        markdown_documents.insert(path.clone(), entry);
                     }
-                    path.exists().then(|| {
-                        Value::String(
-                            markdown_documents
-                                .get(&path)
-                                .expect("document was inserted")
-                                .body
-                                .clone(),
-                        )
-                    })
+                    markdown_documents
+                        .get(&path)
+                        .filter(|(exists, _)| *exists)
+                        .map(|(_, document)| Value::String(document.body.clone()))
                 }
                 FieldSource::Frontmatter { file, key } => {
                     let path = source_path(model, location, file.as_deref())?;
                     if !markdown_documents.contains_key(&path) {
-                        markdown_documents.insert(path.clone(), MarkdownDocument::read(&path)?);
+                        let entry = match reader.read_str(&path)? {
+                            Some(contents) => (true, MarkdownDocument::parse(contents, &path)?),
+                            None => (false, MarkdownDocument::default()),
+                        };
+                        markdown_documents.insert(path.clone(), entry);
                     }
                     markdown_documents
                         .get(&path)
-                        .and_then(|document| {
+                        .and_then(|(_, document)| {
                             document
                                 .frontmatter
                                 .get(serde_yaml::Value::String(key.clone()))
@@ -718,9 +965,47 @@ impl Workspace {
             key: record_key(&relative, &values),
             model: model.name.clone(),
             path: relative,
-            revision: record_revision(model, location)?,
+            revision: record_revision(model, location, &mut reader)?,
             values,
         })
+    }
+}
+
+/// Reads each record source file at most once, sharing the bytes between
+/// field parsing and revision hashing.
+#[derive(Default)]
+struct SourceReader {
+    files: HashMap<PathBuf, Option<Vec<u8>>>,
+}
+
+impl SourceReader {
+    /// The file's contents, or `None` if it does not exist.
+    fn read(&mut self, path: &Path) -> Result<Option<&[u8]>, WorkspaceError> {
+        if !self.files.contains_key(path) {
+            let contents = match fs::read(path) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(io_error(path, error)),
+            };
+            self.files.insert(path.to_path_buf(), contents);
+        }
+        Ok(self.files.get(path).and_then(Option::as_deref))
+    }
+
+    fn read_str(&mut self, path: &Path) -> Result<Option<&str>, WorkspaceError> {
+        let owned = path.to_path_buf();
+        match self.read(path)? {
+            Some(bytes) => std::str::from_utf8(bytes).map(Some).map_err(|_| {
+                io_error(
+                    owned,
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "stream did not contain valid UTF-8",
+                    ),
+                )
+            }),
+            None => Ok(None),
+        }
     }
 }
 
@@ -792,6 +1077,99 @@ fn discover_record_locations(
     matches
 }
 
+/// Discover record locations for every model in a single directory walk,
+/// pruning subtrees that cannot prefix-match any storage template. Results are
+/// keyed by model name with each list sorted by path, matching what
+/// per-model discovery would have produced.
+fn discover_all_record_locations(
+    root: &Path,
+    models: &BTreeMap<String, Model>,
+) -> DiscoveredLocations {
+    struct Target<'a> {
+        model_name: &'a str,
+        template: &'a str,
+        depth: usize,
+        wants_dir: bool,
+    }
+    let targets = models
+        .values()
+        .map(|model| Target {
+            model_name: &model.name,
+            template: model.storage.path(),
+            depth: model.storage.path().split('/').count(),
+            wants_dir: matches!(model.storage, Storage::Directory { .. }),
+        })
+        .collect::<Vec<_>>();
+    let mut results: DiscoveredLocations = models
+        .keys()
+        .map(|name| (name.clone(), Vec::new()))
+        .collect();
+    let Some(max_depth) = targets.iter().map(|target| target.depth).max() else {
+        return results;
+    };
+    let walker = WalkDir::new(root)
+        .follow_links(false)
+        .min_depth(1)
+        .max_depth(max_depth)
+        .into_iter()
+        .filter_entry(|entry| {
+            if !entry.file_type().is_dir() {
+                return true;
+            }
+            let Ok(relative) = entry.path().strip_prefix(root) else {
+                return true;
+            };
+            targets
+                .iter()
+                .any(|target| template_prefix_matches(target.template, relative))
+        });
+    for entry in walker.filter_map(Result::ok) {
+        let Ok(relative) = entry.path().strip_prefix(root).map(Path::to_path_buf) else {
+            continue;
+        };
+        let is_dir = entry.file_type().is_dir();
+        for target in &targets {
+            if target.depth != entry.depth() || target.wants_dir != is_dir {
+                continue;
+            }
+            if let Some(captures) = match_storage_path(target.template, &relative) {
+                results
+                    .get_mut(target.model_name)
+                    .expect("model result list was pre-inserted")
+                    .push((entry.path().to_path_buf(), captures));
+            }
+        }
+    }
+    for locations in results.values_mut() {
+        locations.sort_by(|left, right| left.0.cmp(&right.0));
+    }
+    results
+}
+
+/// Whether a directory's project-relative path could contain (or be) a record
+/// location for the template: every existing component must match the
+/// template's corresponding segment. Used to prune the discovery walk, so a
+/// false negative would silently lose records — keep this permissive.
+fn template_prefix_matches(template: &str, path: &Path) -> bool {
+    let template_parts = template.split('/').collect::<Vec<_>>();
+    let path_parts = path
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => value.to_str(),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if path_parts.len() > template_parts.len() {
+        return false;
+    }
+    template_parts
+        .iter()
+        .zip(path_parts)
+        .all(|(expected, actual)| {
+            segment_pattern(expected).is_some_and(|(pattern, _variables)| pattern.is_match(actual))
+        })
+}
+
 fn match_storage_path(template: &str, path: &Path) -> Option<BTreeMap<String, String>> {
     let template_parts = template.split('/').collect::<Vec<_>>();
     let path_parts = path
@@ -820,7 +1198,24 @@ fn match_storage_path(template: &str, path: &Path) -> Option<BTreeMap<String, St
     Some(captures)
 }
 
+/// Segment patterns are matched against every walked directory entry, so
+/// compiled regexes are memoized; the key space is the handful of distinct
+/// segments in model storage templates.
 fn segment_pattern(template: &str) -> Option<(Regex, Vec<String>)> {
+    static PATTERNS: LazyLock<RwLock<HashMap<String, SegmentMatcher>>> =
+        LazyLock::new(|| RwLock::new(HashMap::new()));
+    if let Some(cached) = PATTERNS.read().expect("segment pattern lock").get(template) {
+        return cached.clone();
+    }
+    let compiled = compile_segment_pattern(template);
+    PATTERNS
+        .write()
+        .expect("segment pattern lock")
+        .insert(template.to_owned(), compiled.clone());
+    compiled
+}
+
+fn compile_segment_pattern(template: &str) -> Option<(Regex, Vec<String>)> {
     let mut pattern = String::from("^");
     let mut variables = Vec::new();
     let mut remaining = template;
@@ -855,7 +1250,54 @@ fn render_storage_path(
     Ok(path)
 }
 
-fn render_output_path(
+/// Find a record by canonical key, storage path, or a unique `id`/`slug` value.
+/// The slice must contain records of a single model.
+fn find_in_records<'a>(
+    records: &[&'a Record],
+    model_name: &str,
+    selector: &str,
+) -> Result<&'a Record, WorkspaceError> {
+    if let Some(record) = records
+        .iter()
+        .copied()
+        .find(|record| record.key == selector || record.path.to_string_lossy() == selector)
+    {
+        return Ok(record);
+    }
+    let matches = records
+        .iter()
+        .copied()
+        .filter(|record| {
+            ["id", "slug"].iter().any(|field| {
+                record.values.get(*field).is_some_and(|value| match value {
+                    Value::String(text) => text == selector,
+                    Value::Number(number) => number.to_string() == selector,
+                    _ => false,
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [record] => Ok(record),
+        [] => Err(WorkspaceError::UnknownRecord {
+            model: model_name.to_owned(),
+            key: selector.to_owned(),
+        }),
+        _ => Err(WorkspaceError::Invalid(format!(
+            "record selector {selector:?} is ambiguous; use one of: {}",
+            matches
+                .iter()
+                .map(|record| record.key.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
+}
+
+/// Render a `{field}`-placeholder path template against record values, e.g. for
+/// model outputs or site permalinks. Rendered values must be scalar and must
+/// not introduce path separators or unsafe segments.
+pub fn render_path_template(
     template: &str,
     values: &BTreeMap<String, Value>,
 ) -> Result<PathBuf, WorkspaceError> {
@@ -1077,7 +1519,34 @@ fn source_path(
     }
 }
 
-fn record_revision(model: &Model, location: &Path) -> Result<String, WorkspaceError> {
+/// The record's optimistic-concurrency token: a SHA-256 over each source
+/// file's project-relative name and contents. The byte scheme (name, `0`,
+/// contents, `0`, in `BTreeSet` order) must never change — stored revisions
+/// are compared against freshly computed ones.
+fn record_revision(
+    model: &Model,
+    location: &Path,
+    reader: &mut SourceReader,
+) -> Result<String, WorkspaceError> {
+    let files = record_source_files(model, location, false);
+    let mut hasher = Sha256::new();
+    for path in files {
+        let relative = path.strip_prefix(location).unwrap_or(&path);
+        hasher.update(relative.as_os_str().as_encoded_bytes());
+        hasher.update([0]);
+        if let Some(contents) = reader.read(&path)? {
+            hasher.update(contents);
+        }
+        hasher.update([0]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// The files a record's identity depends on. Revisions hash only content
+/// sources (`include_assets: false` — the historical revision file set, which
+/// must not change); fingerprints also track asset files so an added or
+/// removed asset invalidates the cached record.
+fn record_source_files(model: &Model, location: &Path, include_assets: bool) -> BTreeSet<PathBuf> {
     let mut files = BTreeSet::new();
     match &model.storage {
         Storage::File { .. } => {
@@ -1090,7 +1559,8 @@ fn record_revision(model: &Model, location: &Path) -> Result<String, WorkspaceEr
                     FieldSource::Markdown { file } | FieldSource::Frontmatter { file, .. } => {
                         file.as_deref()
                     }
-                    FieldSource::Path { .. } | FieldSource::Asset { .. } => None,
+                    FieldSource::Asset { file } => include_assets.then_some(file.as_str()),
+                    FieldSource::Path { .. } => None,
                 };
                 if let Some(file) = file {
                     files.insert(location.join(file));
@@ -1098,18 +1568,31 @@ fn record_revision(model: &Model, location: &Path) -> Result<String, WorkspaceEr
             }
         }
     }
-    let mut hasher = Sha256::new();
+    files
+}
+
+/// A cheap stat-based change token for a record's source files: per file the
+/// relative name with `mtime_ns:size`, or `absent`. Comparing stored and
+/// fresh fingerprints decides whether a cached record needs re-reading.
+fn record_fingerprint(model: &Model, location: &Path) -> String {
+    let files = record_source_files(model, location, true);
+    let mut parts = Vec::with_capacity(files.len());
     for path in files {
         let relative = path.strip_prefix(location).unwrap_or(&path);
-        hasher.update(relative.as_os_str().as_encoded_bytes());
-        hasher.update([0]);
-        if path.exists() {
-            let contents = fs::read(&path).map_err(|source| io_error(&path, source))?;
-            hasher.update(contents);
-        }
-        hasher.update([0]);
+        let state = match fs::metadata(&path) {
+            Ok(metadata) => {
+                let mtime = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |duration| duration.as_nanos());
+                format!("{mtime}:{}", metadata.len())
+            }
+            Err(_) => "absent".to_owned(),
+        };
+        parts.push(format!("{}={state}", relative.to_string_lossy()));
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    parts.join(";")
 }
 
 fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), WorkspaceError> {
@@ -1258,13 +1741,15 @@ fn validate_references(
         .filter_map(|field| field.reference.as_ref())
         .map(|reference| (reference.model.clone(), reference.field.clone()))
         .collect::<BTreeSet<_>>();
-    for (model_name, field_name) in targets {
+    let mut target_values: HashSet<(&str, &str, String)> = HashSet::new();
+    for (model_name, field_name) in &targets {
         let mut seen = BTreeMap::new();
-        for record in records.iter().filter(|record| record.model == model_name) {
-            let Some(value) = record.values.get(&field_name) else {
+        for record in records.iter().filter(|record| &record.model == model_name) {
+            let Some(value) = record.values.get(field_name) else {
                 continue;
             };
             let identity = value.to_string();
+            target_values.insert((model_name.as_str(), field_name.as_str(), identity.clone()));
             if let Some(previous) = seen.insert(identity, record.path.clone()) {
                 diagnostics.push(Diagnostic::error(
                     format!("model {model_name}.fields.{field_name}"),
@@ -1313,10 +1798,11 @@ fn validate_references(
                 vec![value]
             };
             for value in values {
-                let exists = records.iter().any(|candidate| {
-                    candidate.model == reference.model
-                        && candidate.values.get(&reference.field) == Some(value)
-                });
+                let exists = target_values.contains(&(
+                    reference.model.as_str(),
+                    reference.field.as_str(),
+                    value.to_string(),
+                ));
                 if !exists {
                     diagnostics.push(Diagnostic::error(
                         format!("{}:{name}", record.path.display()),
@@ -1345,6 +1831,35 @@ fn relationship_values(value: &Value, many: bool) -> Vec<&Value> {
     }
 }
 
+/// Full project validation over an in-memory record set. `problems` seeds the
+/// diagnostics with any per-record read failures from the scan or sync.
+fn validation_report(
+    loaded: &LoadedWorkspace,
+    records: &[Record],
+    problems: Vec<Diagnostic>,
+) -> ValidationReport {
+    let mut diagnostics = problems;
+    diagnostics.extend(problems_to_diagnostics(validate_config(&loaded.config)));
+    diagnostics.extend(problems_to_diagnostics(validate_navigation(
+        &loaded.config,
+        &loaded.views,
+    )));
+    for model in loaded.models.values() {
+        diagnostics.extend(problems_to_diagnostics(validate_model(model)));
+    }
+    for view in loaded.views.values() {
+        diagnostics.extend(problems_to_diagnostics(validate_view(view, &loaded.models)));
+    }
+    validate_records(&loaded.models, records, &mut diagnostics);
+    validate_references(&loaded.models, records, &mut diagnostics);
+    ValidationReport {
+        models: loaded.models.len(),
+        views: loaded.views.len(),
+        records: records.len(),
+        diagnostics,
+    }
+}
+
 fn problems_to_diagnostics(problems: Vec<Problem>) -> Vec<Diagnostic> {
     problems
         .into_iter()
@@ -1359,15 +1874,9 @@ fn io_error(path: impl AsRef<Path>, source: std::io::Error) -> WorkspaceError {
     }
 }
 
-fn definitions_changed(root: &Path, path: &Path) -> bool {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        root.join(path)
-    };
-    let Ok(relative) = absolute.strip_prefix(root) else {
-        return false;
-    };
+/// Whether a project-relative path is part of the project definitions, whose
+/// changes invalidate every cached record.
+fn is_definition_path(relative: &Path) -> bool {
     relative == Path::new(".omniapp/config.yml")
         || relative.starts_with(".omniapp/models")
         || relative.starts_with(".omniapp/views")
@@ -1400,6 +1909,204 @@ mod tests {
         .unwrap();
         assert_eq!(captures["book"], "war-and-peace");
         assert_eq!(captures["slug"], "opening");
+    }
+
+    #[test]
+    fn template_prefix_matching_prunes_only_impossible_directories() {
+        let template = "series/{series}/books/{book}/beatsheets/{instance}/beats/{slug}.md";
+        for viable in [
+            "series",
+            "series/dune",
+            "series/dune/books",
+            "series/dune/books/messiah/beatsheets/main",
+        ] {
+            assert!(
+                template_prefix_matches(template, Path::new(viable)),
+                "{viable} should stay walkable"
+            );
+        }
+        for pruned in [
+            "archive",
+            "series/dune/docs",
+            "series/dune/books/messiah/beatsheets/main/beats/opening.md/extra",
+        ] {
+            assert!(
+                !template_prefix_matches(template, Path::new(pruned)),
+                "{pruned} should be pruned"
+            );
+        }
+        // A path exactly as deep as the template must match so directory
+        // records are not pruned away.
+        assert!(template_prefix_matches(
+            "books/{slug}",
+            Path::new("books/dune")
+        ));
+    }
+
+    #[test]
+    fn unified_discovery_matches_per_model_discovery() {
+        let directory = tempdir().unwrap();
+        let root = directory.path();
+        for path in [
+            "books/dune/book.yml",
+            "books/hyperion/book.yml",
+            "notes/first.md",
+            "unrelated/deep/tree/file.md",
+        ] {
+            let absolute = root.join(path);
+            fs::create_dir_all(absolute.parent().unwrap()).unwrap();
+            fs::write(absolute, "title: x\n").unwrap();
+        }
+        let book = Model {
+            version: 1,
+            name: "Book".into(),
+            label: None,
+            description: None,
+            storage: Storage::Directory {
+                path: "books/{slug}".into(),
+            },
+            fields: BTreeMap::new(),
+            outputs: BTreeMap::new(),
+        };
+        let note = Model {
+            version: 1,
+            name: "Note".into(),
+            label: None,
+            description: None,
+            storage: Storage::File {
+                path: "notes/{slug}.md".into(),
+            },
+            fields: BTreeMap::new(),
+            outputs: BTreeMap::new(),
+        };
+        let models = BTreeMap::from([("Book".to_owned(), book), ("Note".to_owned(), note)]);
+        let unified = discover_all_record_locations(root, &models);
+        for (name, model) in &models {
+            let per_model = discover_record_locations(root, &model.storage);
+            assert_eq!(unified[name], per_model, "discovery diverged for {name}");
+        }
+        assert_eq!(unified["Book"].len(), 2);
+        assert_eq!(unified["Note"].len(), 1);
+    }
+
+    #[test]
+    fn sync_cache_rereads_only_changed_records() {
+        let directory = tempdir().unwrap();
+        let root = directory.path();
+        let model = Model {
+            version: 1,
+            name: "Note".into(),
+            label: None,
+            description: None,
+            storage: Storage::File {
+                path: "notes/{slug}.md".into(),
+            },
+            fields: BTreeMap::from([
+                (
+                    "slug".into(),
+                    field(
+                        FieldType::String,
+                        true,
+                        FieldSource::Path {
+                            variable: "slug".into(),
+                        },
+                    ),
+                ),
+                (
+                    "title".into(),
+                    field(
+                        FieldType::String,
+                        true,
+                        FieldSource::Frontmatter {
+                            file: None,
+                            key: "title".into(),
+                        },
+                    ),
+                ),
+            ]),
+            outputs: BTreeMap::new(),
+        };
+        write_test_project(root, &model);
+        fs::create_dir_all(root.join("notes")).unwrap();
+        fs::write(root.join("notes/one.md"), "---\ntitle: One\n---\n").unwrap();
+        fs::write(root.join("notes/two.md"), "---\ntitle: Two\n---\n").unwrap();
+        let workspace = Workspace::new(root);
+
+        let first = workspace.sync_cache().unwrap();
+        assert_eq!(first.refreshed, 2);
+        assert_eq!(first.records.len(), 2);
+
+        // Nothing changed: nothing is re-read.
+        let second = workspace.sync_cache().unwrap();
+        assert_eq!(second.refreshed, 0);
+        assert_eq!(second.removed, 0);
+        assert_eq!(second.records.len(), 2);
+
+        // Touch one file with new contents: only that record refreshes.
+        fs::write(root.join("notes/one.md"), "---\ntitle: One updated\n---\n").unwrap();
+        let third = workspace.sync_cache().unwrap();
+        assert_eq!(third.refreshed, 1);
+        let updated = third
+            .records
+            .iter()
+            .find(|record| record.key == "notes/one.md")
+            .unwrap();
+        assert_eq!(updated.values["title"], serde_json::json!("One updated"));
+
+        // Delete a file: its row disappears without touching the other.
+        fs::remove_file(root.join("notes/two.md")).unwrap();
+        let fourth = workspace.sync_cache().unwrap();
+        assert_eq!(fourth.refreshed, 0);
+        assert_eq!(fourth.removed, 1);
+        assert_eq!(fourth.records.len(), 1);
+
+        // Changing the model definitions invalidates every cached record.
+        let mut changed = model.clone();
+        changed.description = Some("changed".into());
+        fs::write(
+            root.join(".omniapp/models/model.yml"),
+            serde_yaml::to_string(&changed).unwrap(),
+        )
+        .unwrap();
+        let fifth = workspace.sync_cache().unwrap();
+        assert_eq!(fifth.refreshed, 1);
+    }
+
+    #[test]
+    fn record_revision_scheme_is_pinned() {
+        // Revisions are optimistic-concurrency tokens compared against stored
+        // values, so the hashing scheme must never drift. Expected digest is
+        // sha256(relative_name . 0 . contents . 0) computed independently.
+        let directory = tempdir().unwrap();
+        let model = Model {
+            version: 1,
+            name: "Book".into(),
+            label: None,
+            description: None,
+            storage: Storage::File {
+                path: "books/{slug}.md".into(),
+            },
+            fields: BTreeMap::from([(
+                "title".into(),
+                field(
+                    FieldType::String,
+                    true,
+                    FieldSource::Frontmatter {
+                        file: None,
+                        key: "title".into(),
+                    },
+                ),
+            )]),
+            outputs: BTreeMap::new(),
+        };
+        let location = directory.path().join("books/dune.md");
+        fs::create_dir_all(location.parent().unwrap()).unwrap();
+        fs::write(&location, "---\ntitle: Dune\n---\nDesert planet.\n").unwrap();
+        let revision = record_revision(&model, &location, &mut SourceReader::default()).unwrap();
+        assert_eq!(
+            revision,
+            "b9b4801775c40ec41cfb362b75617753f189777f28b1e27b19738b722b4e6d44"
+        );
     }
 
     #[test]
@@ -1534,7 +2241,7 @@ mod tests {
         );
         let cache = Cache::open(&workspace.metadata_dir().join("cache.sqlite3")).unwrap();
         let cached = cache
-            .query("Book", &omniapp_schema::Query::default(), 1)
+            .query("Book", &omniapp_schema::Query::default(), 1, None)
             .unwrap();
         assert_eq!(cached.records[0].values["title"], "Dune Messiah");
         let current = workspace.records(&model).unwrap().remove(0);

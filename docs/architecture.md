@@ -12,10 +12,11 @@
 
 | Crate | Owns | Must not own |
 |---|---|---|
-| `omniapp-schema` | Serializable project/model/view types and definition validation | Filesystem access beyond reading a definition |
+| `omniapp-schema` | Serializable project/model/view/site types and definition validation | Filesystem access beyond reading a definition |
 | `omniapp-core` | Workspace discovery, record codecs, CRUD, revisions, watcher, reference/output resolution, queries, validation, caches | HTTP or terminal presentation |
-| `omniapp-web` | Loopback HTTP API, guarded asset delivery, and generated UI | Direct project-file writes |
-| `omniapp-cli` | Command parsing, initialization, process lifecycle | Record parsing or business invariants |
+| `omniapp-site` | Site config/page discovery, template environment, record context resolution, route table, static build pipeline | HTTP serving; record parsing or writing (delegates to core) |
+| `omniapp-web` | Loopback HTTP API, guarded asset delivery, the admin application, live public-site serving | Direct project-file writes |
+| `omniapp-cli` | Command parsing, initialization, build orchestration, process lifecycle | Record parsing or business invariants |
 
 This direction lets future desktop shells, language bindings, and background services reuse the same core API.
 
@@ -38,7 +39,7 @@ models + project files
               debounced filesystem watcher
 ```
 
-The server performs one complete cache build at startup, then a recursive filesystem watcher batches changes and refreshes only affected record locations. Model, view, or project configuration changes intentionally trigger a complete rebuild. Web listings and saved-view queries execute against cached JSON through SQLite JSON functions; FTS queries use the incrementally maintained FTS5 table. CLI reads remain filesystem-direct so one-shot commands always observe canonical state.
+Startup reconciles the cache with the filesystem instead of rebuilding it: one pruned directory walk discovers record locations for every model at once, stat-based fingerprints (`mtime_ns:size` per source file) decide which records are re-read, changed records are parsed in parallel, and everything else is served from the cache untouched. A digest of the model definitions is stored alongside the records; when definitions change, every record is re-read. The recursive filesystem watcher batches changes and refreshes only affected record locations. Web listings and saved-view queries execute against cached JSON through SQLite JSON functions; FTS queries use the incrementally maintained FTS5 table. Record detail, relationship, and asset lookups in the web server run against an in-memory `RecordsSnapshot` loaded from the cache and invalidated by the watcher (and immediately after API writes). CLI one-shot commands run the same fingerprint sync first, so they always observe canonical state — including direct file edits — while staying fast; `validate --full` bypasses the fingerprints, re-reads everything from disk, and rebuilds the cache. The cache remains derived and disposable: deleting `cache.sqlite3` costs one full scan, never data.
 
 ## Delivered phases
 
@@ -56,7 +57,7 @@ The server performs one complete cache build at startup, then a recursive filesy
 
 - Declarative `eq`, `not_eq`, comparison, containment, membership, and null filters.
 - Multi-field ascending/descending ordering and pagination.
-- Rebuildable SQLite record cache and FTS5 index.
+- Rebuildable SQLite record cache and FTS5 index with stat-fingerprint incremental sync.
 - Debounced recursive filesystem watcher with per-record upsert/removal.
 - SQLite-backed declarative filtering, ordering, null handling, and pagination.
 - An embedding table whose contents are explicitly rebuildable.
@@ -107,6 +108,24 @@ The server performs one complete cache build at startup, then a recursive filesy
 - A guarded loopback route serves configured assets only, rejects `.omniapp` and symlink escapes, and supports HTTP byte ranges.
 - The generated UI renders lazy image thumbnails, video/audio players, and links for other file types.
 
+### Phase 9: the admin application — implemented
+
+- Config-driven title and three-color theme; every derived shade is computed from the configured bases.
+- Two-tier navigation: curated sidebar entries, optional tab groups, hidden-but-addressable views.
+- Hash-routed record pages: a formatted read view with backreference tabs, full-page edit and create forms, deep links, and browser history. The modal editor is gone.
+- Dedicated renderers for every view type: table, board, calendar, gallery, timeline, tree, form, and custom.
+- View-wide substring search executed in the SQLite cache alongside the view's filters.
+- Served on its own port at `/`; each public site gets its own port.
+
+### Phase 10: static site generation — implemented
+
+- `.omniapp/sites/<name>/` holds one site each — minijinja layouts, includes, pages, and assets; a project can publish any number of sites from the same records. Page frontmatter is deliberately open (user space), unlike strict `.omniapp` definitions.
+- Generator pages produce one URL per record from a model or saved view, with `{field}` permalinks validated like output templates.
+- Templates see lazy record objects: reference fields resolve to records, backreferences via `inbound`, page URLs via `record.url`.
+- `omniapp build` renders each site to a staging directory and only replaces `_site/<name>/` on success, collecting every page error; reserved prefixes (`assets/`, `files/`) and within-site URL collisions fail that site's build without stopping the others.
+- `omniapp serve` renders every site live, one port per site plus one for the admin — the watcher invalidates the per-site model cache and the shared records snapshot on any change, so record, template, and config edits appear on the next request; template errors render a diagnostic page.
+- Record assets are exposed as `/files/<project-relative>` in both modes; site assets as `/assets/...`.
+
 ## Remaining roadmap
 
 ### Production hardening
@@ -121,14 +140,13 @@ The server performs one complete cache build at startup, then a recursive filesy
 ### Product and extension work
 
 1. Add relationship traversal and backreference joins to declarative query filters, grouping, and ordering.
-2. Implement specialized tree, board, calendar, gallery, and timeline renderers; the current browser surface is table/form based.
-3. Add real Markdown rendering/preview alongside editing, plus search result excerpts and highlighting.
-4. Embed `sqlite-vec`; define an embedding-provider interface, dimension changes, background indexing, and fully rebuildable semantic search.
-5. Add a sandboxed script host and event hooks. Scripts must call application services rather than edit canonical files directly.
-6. Add publishing/build commands that execute pipelines using resolved output destinations; output path discovery alone is implemented today.
-7. Add optional derived thumbnails/posters for very large media. Current previews stream original files and size them in the browser.
-8. Declare a stable project format when appropriate, then add migrations and a compatibility corpus.
-9. Add packaging, installers, shell completions, CI, and signed release automation.
+2. Add Markdown rendering/preview to the admin record pages (the public site already renders Markdown), plus search result excerpts and highlighting.
+3. Embed `sqlite-vec`; define an embedding-provider interface, dimension changes, background indexing, and fully rebuildable semantic search.
+4. Add a sandboxed script host and event hooks (including view `actions`). Scripts must call application services rather than edit canonical files directly.
+5. Add listing-page pagination to the site generator (`views.*` and full record lists cover current needs).
+6. Add optional derived thumbnails/posters for very large media. Current previews stream original files and size them in the browser.
+7. Declare a stable project format when appropriate, then add migrations and a compatibility corpus.
+8. Add packaging, installers, shell completions, CI, and signed release automation.
 
 Remote serving remains out of scope. If introduced, it requires authentication, authorization, CSRF protection, and a different asset trust model; loopback-only assumptions must not silently carry over.
 
@@ -139,6 +157,8 @@ Remote serving remains out of scope. If introduced, it requires authentication, 
 ## Generated outputs
 
 Models name output path templates under `outputs`. For example, `publication: build/{slug}` establishes a discoverable destination without putting executable behavior into a model. `omniapp outputs`, the core service, and HTTP resolve templates for a record and inspect the current filesystem destination. Output paths are project-relative, cannot enter `.omniapp`, and cannot traverse above the project root.
+
+Outputs and site permalinks are deliberately independent. `outputs` declares where external pipelines (scripts, encoders) put artifacts a record expects — an episode's `mp3`, a transcript. Site permalinks live in `.omniapp/site/pages/` because a record's public URL is presentation, not model data; models never reference the site.
 
 ## Concurrency and failures
 

@@ -2,6 +2,7 @@
 members = [
     "crates/omniapp-schema",
     "crates/omniapp-core",
+    "crates/omniapp-site",
     "crates/omniapp-web",
     "crates/omniapp-cli",
 ]
@@ -17,9 +18,12 @@ anyhow = "1"
 axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
+minijinja = { version = "2", features = ["loader"] }
 notify = "8.2"
 open = "5"
 percent-encoding = "2"
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+rayon = "1"
 regex = "1"
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

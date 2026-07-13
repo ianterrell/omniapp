@@ -89,6 +89,94 @@ query:
 actions: []
 ";
 
+const DEFAULT_LAYOUT: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}{{ site.title }}{% endblock %}</title>
+  <link rel="stylesheet" href="/assets/main.css">
+</head>
+<body>
+  <header class="site-header">
+    <a class="site-title" href="/">{{ site.title }}</a>
+  </header>
+  <main>
+    {% block main %}{% endblock %}
+  </main>
+  <footer class="site-footer">
+    <p>{{ site.description }}</p>
+  </footer>
+</body>
+</html>
+"#;
+
+const DEFAULT_INDEX_PAGE: &str = r#"{% extends "layouts/base.html" %}
+{% block main %}
+  <h1>{{ site.title }}</h1>
+  <ul class="record-list">
+    {% for book in records.Book %}
+      <li>
+        <a href="{{ book.url }}">{{ book.title }}</a>
+        {% if book.author %}<span class="byline">by {{ book.author }}</span>{% endif %}
+        <span class="status">{{ book.status }}</span>
+      </li>
+    {% else %}
+      <li class="empty">No books yet.</li>
+    {% endfor %}
+  </ul>
+{% endblock %}
+"#;
+
+const DEFAULT_RECORD_PAGE: &str = r#"---
+model: Book
+permalink: books/{slug}/
+---
+{% extends "layouts/base.html" %}
+{% block title %}{{ record.title }} · {{ site.title }}{% endblock %}
+{% block main %}
+  <h1>{{ record.title }}</h1>
+  {% if record.author %}<p class="byline">by {{ record.author }}</p>{% endif %}
+  {% if record.cover %}<img class="cover" src="{{ record.cover | asset_url }}" alt="{{ record.title }}">{% endif %}
+  {{ record.notes | markdown }}
+{% endblock %}
+"#;
+
+const DEFAULT_SITE_CSS: &str = r":root { color-scheme: light }
+body {
+  margin: 0 auto;
+  max-width: 42rem;
+  padding: 0 1.25rem 4rem;
+  color: #1d2321;
+  background: #fdfdfc;
+  font: 17px/1.65 ui-serif, Georgia, serif;
+}
+a { color: #245c47 }
+h1 { font-size: 2rem; letter-spacing: -0.02em; line-height: 1.2 }
+.site-header { padding: 2.2rem 0 2.6rem }
+.site-title {
+  color: inherit;
+  text-decoration: none;
+  font-weight: 700;
+  font-size: 1.05rem;
+  letter-spacing: 0.01em;
+}
+.byline { color: #68736e }
+.status {
+  font: 12px/1.6 ui-sans-serif, system-ui, sans-serif;
+  color: #245c47;
+  background: #dcebe4;
+  border-radius: 99px;
+  padding: 1px 9px;
+  margin-left: 6px;
+  vertical-align: 2px;
+}
+.record-list { list-style: none; padding: 0 }
+.record-list li { padding: 0.45rem 0; border-bottom: 1px solid #e8ebe8 }
+.cover { max-width: 100%; border-radius: 8px }
+.site-footer { margin-top: 4rem; color: #68736e; font-size: 0.85rem }
+";
+
 const AGENTS_SECTION_START: &str = "<!-- omniapp:agents:start -->";
 const AGENTS_SECTION_END: &str = "<!-- omniapp:agents:end -->";
 
@@ -121,17 +209,42 @@ enum Command {
     Validate {
         #[arg(default_value = ".")]
         path: PathBuf,
+        /// Re-read every record from disk and rebuild the cache instead of
+        /// trusting file fingerprints.
+        #[arg(long)]
+        full: bool,
     },
-    /// Start the local web application.
+    /// Render the public site(s) to static directories under _site/.
+    Build {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Build only this site (a directory name under .omniapp/sites).
+        #[arg(long)]
+        site: Option<String>,
+        /// Output directory for a single site (requires --site).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Override the configured site.url for this build (requires --site).
+        #[arg(long)]
+        base_url: Option<String>,
+        /// Treat undefined template variables as errors.
+        #[arg(long)]
+        strict: bool,
+    },
+    /// Serve every site (one port each) plus the admin application.
     Serve {
         #[arg(default_value = ".")]
         path: PathBuf,
-        /// First port to try. OmniApp increments until one is available.
+        /// First port to try. Each site takes the next available port, then
+        /// the admin.
         #[arg(long, default_value_t = 7777)]
         port: u16,
         /// Do not open the default browser.
         #[arg(long)]
         no_open: bool,
+        /// Do not serve the admin application.
+        #[arg(long)]
+        no_admin: bool,
     },
     /// List records for a model.
     List {
@@ -229,12 +342,20 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Init { path, name } => initialize(&path, name.as_deref(), cli.json),
-        Command::Validate { path } => validate(&path, cli.json),
+        Command::Validate { path, full } => validate(&path, full, cli.json),
+        Command::Build {
+            path,
+            site,
+            out,
+            base_url,
+            strict,
+        } => build(&path, site, out, base_url, strict, cli.json),
         Command::Serve {
             path,
             port,
             no_open,
-        } => serve(path, port, no_open, cli.json).await,
+            no_admin,
+        } => serve(path, port, no_open, no_admin, cli.json).await,
         Command::List {
             model,
             path,
@@ -294,12 +415,34 @@ fn initialize(path: &Path, requested_name: Option<&str>, json: bool) -> Result<(
         .unwrap_or_else(|| "OmniApp Project".to_owned());
     let name = requested_name.unwrap_or(&inferred_name);
     let quoted_name = serde_json::to_string(name)?;
-    fs::write(
-        metadata.join("config.yml"),
-        format!("version: 1\nname: {quoted_name}\ndescription: A local-first OmniApp project.\n"),
-    )?;
+    let config = format!(
+        r##"version: 1
+name: {quoted_name}
+description: A local-first OmniApp project.
+theme:
+  accent: "#245c47"
+  sidebar: "#17231e"
+  background: "#f6f7f4"
+navigation:
+  - view: library
+"##
+    );
+    fs::write(metadata.join("config.yml"), config)?;
     fs::write(metadata.join("models/book.yml"), DEFAULT_MODEL)?;
     fs::write(metadata.join("views/library.yml"), DEFAULT_VIEW)?;
+    let site = metadata.join("sites/main");
+    fs::create_dir_all(site.join("layouts"))?;
+    fs::create_dir_all(site.join("includes"))?;
+    fs::create_dir_all(site.join("pages"))?;
+    fs::create_dir_all(site.join("assets"))?;
+    fs::write(
+        site.join("site.yml"),
+        format!("version: 1\ntitle: {quoted_name}\n"),
+    )?;
+    fs::write(site.join("layouts/base.html"), DEFAULT_LAYOUT)?;
+    fs::write(site.join("pages/index.html"), DEFAULT_INDEX_PAGE)?;
+    fs::write(site.join("pages/book.html"), DEFAULT_RECORD_PAGE)?;
+    fs::write(site.join("assets/main.css"), DEFAULT_SITE_CSS)?;
     fs::write(
         metadata.join("scripts/README.md"),
         "# Project scripts\n\nExecutable project automation will live here. Scripts should use the OmniApp API instead of editing record files directly.\n",
@@ -351,8 +494,10 @@ This directory is the **{project_name}** OmniApp project. It is agent-first: pre
 - `.omniapp/config.yml` contains project configuration.
 - `.omniapp/models/*.yml` defines record storage, fields, validation, and relationships.
 - `.omniapp/views/*.yml` defines saved queries and presentation.
+- `.omniapp/sites/<name>/` holds one public site each: layouts, includes, pages, and assets (minijinja templates).
 - `.omniapp/scripts/` is reserved for project automation.
 - `.omniapp/cache.sqlite3*` is generated and disposable; never edit or commit it.
+- `_site/<name>/` is the built output per site; generated and disposable.
 - Content outside `.omniapp/` is project data. Models determine whether each record is a directory or a single Markdown file.
 
 ## CLI workflow
@@ -371,7 +516,10 @@ omniapp search <query>
 omniapp relationships <Model> <id-or-slug>
 omniapp outputs <Model> <id-or-slug>
 omniapp serve
+omniapp build
 ```
+
+`omniapp serve` hosts every site on its own port (in name order from the base port) and the admin application on the next port. `omniapp build` renders each site to `_site/<name>/` for deployment; `--site <name>` builds one.
 
 Add `--json` to any command when structured output is more useful. For larger writes, use `--input file.json` or pipe JSON to `--input -`.
 
@@ -394,6 +542,7 @@ fn update_gitignore(root: &Path) -> Result<()> {
         ".omniapp/cache.sqlite3",
         ".omniapp/cache.sqlite3-shm",
         ".omniapp/cache.sqlite3-wal",
+        "_site/",
     ];
     if !contents.is_empty() && !contents.ends_with('\n') {
         contents.push('\n');
@@ -408,9 +557,13 @@ fn update_gitignore(root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate(path: &Path, json: bool) -> Result<()> {
+fn validate(path: &Path, full: bool, json: bool) -> Result<()> {
     let workspace = Workspace::new(path);
-    let report = workspace.validate()?;
+    let report = if full {
+        workspace.validate_full()?
+    } else {
+        workspace.validate()?
+    };
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -436,9 +589,61 @@ fn validate(path: &Path, json: bool) -> Result<()> {
     Ok(())
 }
 
-async fn serve(path: PathBuf, port: u16, no_open: bool, json: bool) -> Result<()> {
+fn build(
+    path: &Path,
+    site: Option<String>,
+    out: Option<PathBuf>,
+    base_url: Option<String>,
+    strict: bool,
+    json: bool,
+) -> Result<()> {
+    if site.is_none() && (out.is_some() || base_url.is_some()) {
+        bail!("--out and --base-url apply to a single site; pass --site <name>");
+    }
     let workspace = Workspace::new(path);
-    let report = workspace.validate()?;
+    let reports = omniapp_site::build(
+        &workspace,
+        &omniapp_site::BuildOptions {
+            site,
+            out_dir: out,
+            base_url,
+            strict,
+        },
+    )?;
+    let problems: usize = reports.iter().map(|(_, report)| report.errors.len()).sum();
+    if json {
+        let map = reports
+            .iter()
+            .map(|(name, report)| (name.clone(), report))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        println!("{}", serde_json::to_string_pretty(&map)?);
+    } else {
+        for (name, report) in &reports {
+            for problem in &report.errors {
+                eprintln!("error: {name}: {}: {}", problem.location, problem.message);
+            }
+            if report.errors.is_empty() {
+                println!(
+                    "Built {name}: {} page(s) ({} from records), {} site asset(s), {} record asset(s) into {}",
+                    report.pages + report.record_pages,
+                    report.record_pages,
+                    report.site_assets,
+                    report.record_assets,
+                    report.out_dir.display()
+                );
+            }
+        }
+    }
+    if problems > 0 {
+        bail!("site build failed with {problems} problem(s); existing output was left untouched");
+    }
+    Ok(())
+}
+
+async fn serve(path: PathBuf, port: u16, no_open: bool, no_admin: bool, json: bool) -> Result<()> {
+    let workspace = Workspace::new(path);
+    let synced = workspace.sync_cache()?;
+    let report = workspace.validate_synced(&synced);
     if !report.is_valid() {
         for diagnostic in &report.diagnostics {
             eprintln!(
@@ -448,25 +653,49 @@ async fn serve(path: PathBuf, port: u16, no_open: bool, json: bool) -> Result<()
         }
         bail!("project validation failed; fix the reported problems before serving");
     }
-    let indexed = workspace.rebuild_cache()?;
-    let listener = omniapp_web::bind_available(port).await?;
-    let address = listener.local_addr()?;
-    let url = format!("http://{address}");
+    let indexed = synced.records.len();
+    let bound = omniapp_web::bind(workspace, port, !no_admin).await?;
+    let sites = bound
+        .site_addrs()
+        .into_iter()
+        .map(|(name, addr)| (name, format!("http://{addr}")))
+        .collect::<Vec<_>>();
+    let admin_url = bound.admin_addr().map(|addr| format!("http://{addr}"));
     if json {
         println!(
             "{}",
             serde_json::to_string(&serde_json::json!({
-                "url": url,
+                "sites": sites.iter().cloned().collect::<std::collections::BTreeMap<_, _>>(),
+                "admin_url": admin_url,
                 "indexed": indexed,
             }))?
         );
     } else {
-        println!("OmniApp is running at {url} ({indexed} record(s) indexed)");
+        println!("OmniApp is running ({indexed} record(s) indexed)");
+        let width = sites
+            .iter()
+            .map(|(name, _)| name.len())
+            .chain(std::iter::once(5))
+            .max()
+            .unwrap_or(5);
+        for (name, url) in &sites {
+            println!("  {name:<width$}  {url}/");
+        }
+        if let Some(admin_url) = &admin_url {
+            println!("  {:<width$}  {admin_url}/", "admin");
+        }
     }
-    if !no_open && let Err(error) = open::that(&url) {
+    let open_url = sites
+        .first()
+        .map(|(_, url)| url.clone())
+        .or_else(|| admin_url.clone());
+    if !no_open
+        && let Some(open_url) = open_url
+        && let Err(error) = open::that(&open_url)
+    {
         eprintln!("Could not open the default browser: {error}");
     }
-    omniapp_web::serve(workspace, listener).await?;
+    bound.serve().await?;
     Ok(())
 }
 
@@ -487,9 +716,32 @@ mod tests {
         assert_eq!(report.models, 1);
         assert_eq!(report.views, 1);
 
+        let site = directory.path().join(".omniapp/sites/main");
+        assert!(site.join("site.yml").is_file());
+        assert!(site.join("layouts/base.html").is_file());
+        assert!(site.join("pages/index.html").is_file());
+        assert!(site.join("pages/book.html").is_file());
+        assert!(site.join("assets/main.css").is_file());
+
+        let reports = omniapp_site::build(
+            &Workspace::new(directory.path()),
+            &omniapp_site::BuildOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].1.errors.is_empty(), "{:?}", reports[0].1.errors);
+        assert!(directory.path().join("_site/main/index.html").is_file());
+        assert!(
+            directory
+                .path()
+                .join("_site/main/assets/main.css")
+                .is_file()
+        );
+
         let ignore = fs::read_to_string(directory.path().join(".gitignore")).unwrap();
         assert!(ignore.starts_with("dist/\n"));
         assert!(ignore.contains(".omniapp/cache.sqlite3\n"));
+        assert!(ignore.contains("_site/\n"));
         let agents = fs::read_to_string(directory.path().join("AGENTS.md")).unwrap();
         assert!(agents.contains("Test Library"));
         assert!(agents.contains("omniapp validate"));

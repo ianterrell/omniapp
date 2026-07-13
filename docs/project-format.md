@@ -10,7 +10,21 @@ All paths below are relative to the project root.
 version: 1
 name: Editorial calendar
 description: Local publishing workflow
+theme:
+  accent: "#245c47"
+  sidebar: "#17231e"
+  background: "#f6f7f4"
+navigation:
+  - view: dashboard
+  - label: Posts
+    views: [posts, published, pipeline]
 ```
+
+`name` is the application title shown in the admin sidebar; `description` appears beneath it.
+
+`theme` is optional. Each color is a 6-digit hex value; unset colors fall back to defaults. All other shades — hover states, muted sidebar text, the soft accent tint — are derived from these three bases, with a luminance guard so light sidebar colors keep readable text.
+
+`navigation` is optional. When absent, every view appears in the sidebar. When present it is authoritative: each entry is either a single view (`view: name`, labeled by the view unless `label` overrides it) or a labeled group (`label` + `views`) rendered as one sidebar item with horizontal tabs for its views. A view may appear at most once across all entries. Views left out of `navigation` are hidden from the sidebar but remain addressable by URL.
 
 Model and view files are loaded from `.omniapp/models/*.{yml,yaml}` and `.omniapp/views/*.{yml,yaml}`. Names must be unique within each definition type.
 
@@ -169,8 +183,67 @@ actions:
 
 Filter operators are `eq`, `not_eq`, `lt`, `lte`, `gt`, `gte`, `contains`, `in`, `is_null`, and `is_not_null`. Null operators omit `value`; all others require it. Page sizes must be between 1 and 1000.
 
-Recognized view types are `form`, `table`, `tree`, `board`, `calendar`, `gallery`, `timeline`, and `custom`. Version 1 of the browser client renders the common table/form surface; definitions using the other types remain valid for future specialized renderers.
+Each view type has a dedicated renderer in the admin application:
 
-## Cache
+- `table`: sortable columns from `fields`; reference cells link to the referenced record's page.
+- `board`: kanban columns from the `group_by` field's enum choices (plus a trailing column for records without a value, and appended columns for unexpected values).
+- `gallery`: a card grid; the first `asset` field provides each card's image.
+- `calendar`: a month grid keyed on the first date-typed `query.order` field (else the first date-typed view field); undated records collect in a strip below.
+- `timeline`: a chronological list with date markers, in query order.
+- `tree`: threaded indentation using `group_by` naming a self-reference field (for example a comment's `parent`).
+- `form`: a full-page create form for the model.
+- `custom`: a plain card list, reserved for bespoke renderers.
 
-`.omniapp/cache.sqlite3`, `-wal`, and `-shm` files are generated. They contain normalized JSON records, an FTS5 index, and a reserved rebuildable embeddings table. They must not be used for backup or committed to source control.
+Rows and cards navigate to a full record page — a formatted read view with the record's relationships as tabs and an edit button — rather than opening an inline editor.
+
+Record list endpoints (`/api/views/{view}/records` and `/api/models/{model}/records`) accept `page`, `page_size`, and `q`. The `q` parameter performs a case-insensitive substring match over every string value and the record key, across the entire result set — combined with the view's filters, so totals and pagination reflect the match. (Non-ASCII case folding is not applied.) This is distinct from `/api/search`, which uses FTS5 syntax across all models. `GET /api/models/{model}/record?key=` accepts a canonical key, a storage path, or a unique `id`/`slug` value, mirroring CLI selectors.
+
+When serving, the admin application runs on its own port at `/`; each public site (see below) runs on its own port.
+
+## Sites
+
+A project can publish any number of fully user-styled public sites from the same records. Each site lives in `.omniapp/sites/<name>/` (names use lowercase letters, digits, and hyphens; the directory listing is the registry — there is no site list in config.yml). Sites are rendered with [minijinja](https://docs.rs/minijinja) (Jinja2 syntax):
+
+```text
+.omniapp/sites/<name>/
+  site.yml          # optional site configuration
+  layouts/*.html    # base templates ({% extends "layouts/base.html" %})
+  includes/*.html   # partials ({% include "includes/post-card.html" %})
+  pages/**          # URL-mapped pages (.html and .md)
+  assets/**         # static files, served and copied verbatim under /assets/
+```
+
+`omniapp serve` renders every site live, one port per site in name order starting at the base port, with the admin application on the next port (edits to records, templates, or configuration appear on the next request). `omniapp build` writes one deployable static tree per site to `_site/<name>/` — without the admin application — and a site whose pages error keeps its previous output untouched; `omniapp build --site <name>` builds one site (and unlocks `--out`/`--base-url`). Two sites may publish the same model at different permalinks; `record.url` inside templates always reflects the site being rendered.
+
+`site.yml` accepts `version`, `title` (defaults to the project `name`), `description`, `url` (absolute base URL for feeds/canonical links), and `params`, a free-form mapping exposed to templates as `site.params`.
+
+### Pages
+
+`pages/index.html` maps to `/`; every other page gets a pretty URL: `pages/about.md` becomes `/about/`, `pages/docs/setup.md` becomes `/docs/setup/`. `pages/404.html` is rendered as the not-found page. Pages may begin with a `---` YAML frontmatter block. Unlike `.omniapp` definitions, page frontmatter allows unknown keys — they are user space, exposed to the template as `page.<key>`. Recognized keys: `title`, `permalink` (overrides the derived URL), `layout` (wraps the rendered page in `layouts/<name>.html`, which receives it as `content`), and the generator keys below. `.md` pages are Jinja-rendered, converted from Markdown, then wrapped by their layout; `.html` pages normally use `{% extends %}` instead of `layout`.
+
+A page that declares a record source becomes a generator, producing one page per record:
+
+```html
+---
+view: published            # a saved view: its model, filters, and order
+permalink: posts/{slug}/   # required; {field} placeholders, same rules as outputs
+---
+{% extends "layouts/post.html" %}
+{% block main %}<h1>{{ record.title }}</h1>{{ record.body | markdown }}{% endblock %}
+```
+
+Alternatively declare `model: Post` with optional `filters:`/`order:` (the view query schema). `view` and `model` are mutually exclusive. A trailing `/` in the permalink produces `<path>/index.html`.
+
+### Template context
+
+Every render sees `site` (configuration plus `time`), `records.<Model>` (all records of a model), `views.<name>` (a saved view's records, unpaginated), and `page`; generator pages add `record`, and layout wraps add `content`. Record values resolve lazily: reference fields yield the referenced record objects (`post.author.name`, `post.tags`), `record.url` yields the record's generated page URL, `record.inbound.<Model>` yields backreferences (an author's posts as `author.inbound.Post`), and `record.meta.key/path/model` expose identity.
+
+Filters: `markdown` (CommonMark plus tables, strikethrough, and footnotes), `asset_url` (turns an asset field value into its `/files/...` URL, identical in live serving and builds), `date(format)` (strftime over dates and RFC 3339 date-times), and `where`/`where_not` (filter record lists by field equality); minijinja built-ins such as `sort`, `selectattr`, and `groupby` also apply.
+
+URL paths under `assets/` and `files/` are reserved; a page or permalink that resolves into them is a build error, as is any URL claimed by two sources within the same site. (`admin/` and `api/` are not reserved — the admin lives on its own port.)
+
+## Cache and generated output
+
+`.omniapp/cache.sqlite3`, `-wal`, and `-shm` files are generated. They contain normalized JSON records, an FTS5 index, and a reserved rebuildable embeddings table. They must not be used for backup or committed to source control. `_site/` is likewise generated and should be gitignored; `omniapp init` arranges both.
+
+The cache is kept current by stat fingerprints: each cached record stores the `mtime` and size of its source files, and `validate`, `serve`, and `build` re-read only records whose fingerprints changed (a `touch` is enough to force one file's re-read). Changing anything under `.omniapp/models/` re-reads every record. A rewrite that preserves a file's mtime and size — effectively only a deliberate act — is the one edit fingerprints cannot see; `omniapp validate --full` re-reads every record from disk and rebuilds the cache, and deleting `cache.sqlite3` is always safe.

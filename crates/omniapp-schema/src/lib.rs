@@ -30,6 +30,59 @@ pub struct ProjectConfig {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default)]
+    pub theme: Theme,
+    #[serde(default)]
+    pub navigation: Vec<NavItem>,
+}
+
+/// Base colors for the browser client; unset colors fall back to defaults and
+/// all other shades are derived from these.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Theme {
+    #[serde(default)]
+    pub accent: Option<String>,
+    #[serde(default)]
+    pub sidebar: Option<String>,
+    #[serde(default)]
+    pub background: Option<String>,
+}
+
+/// One primary navigation entry: either a single view or a labelled group of
+/// views rendered as tabs. Exactly one of `view`/`views` must be set.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NavItem {
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub view: Option<String>,
+    #[serde(default)]
+    pub views: Vec<String>,
+}
+
+/// Configuration for the generated public site, stored at `.omniapp/site/site.yml`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SiteConfig {
+    pub version: u32,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub url: Option<String>,
+    pub params: BTreeMap<String, Value>,
+}
+
+impl Default for SiteConfig {
+    fn default() -> Self {
+        Self {
+            version: FORMAT_VERSION,
+            title: None,
+            description: None,
+            url: None,
+            params: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -300,6 +353,96 @@ pub fn validate_config(config: &ProjectConfig) -> Vec<Problem> {
     if config.name.trim().is_empty() {
         problems.push(Problem::new("config.name", "must not be empty"));
     }
+    for (name, color) in [
+        ("accent", &config.theme.accent),
+        ("sidebar", &config.theme.sidebar),
+        ("background", &config.theme.background),
+    ] {
+        if let Some(color) = color
+            && !is_hex_color(color)
+        {
+            problems.push(Problem::new(
+                format!("config.theme.{name}"),
+                format!("{color:?} must be a 6-digit hex color like \"#245c47\""),
+            ));
+        }
+    }
+    for (index, item) in config.navigation.iter().enumerate() {
+        let location = format!("config.navigation[{index}]");
+        match (&item.view, item.views.len()) {
+            (Some(_), 0) => {}
+            (None, count) if count > 0 => {
+                if item
+                    .label
+                    .as_deref()
+                    .is_none_or(|label| label.trim().is_empty())
+                {
+                    problems.push(Problem::new(&location, "view groups require a label"));
+                }
+            }
+            (Some(_), _) => problems.push(Problem::new(
+                &location,
+                "set either view or views, not both",
+            )),
+            (None, _) => problems.push(Problem::new(
+                &location,
+                "requires a view or a non-empty views list",
+            )),
+        }
+    }
+    let mut seen = BTreeSet::new();
+    for item in &config.navigation {
+        for view in item.view.iter().chain(&item.views) {
+            if !seen.insert(view.clone()) {
+                problems.push(Problem::new(
+                    "config.navigation",
+                    format!("view {view:?} is listed more than once"),
+                ));
+            }
+        }
+    }
+    problems
+}
+
+fn is_hex_color(color: &str) -> bool {
+    color.len() == 7 && color.starts_with('#') && color[1..].chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Validate navigation entries against the set of loaded views.
+#[must_use]
+pub fn validate_navigation(config: &ProjectConfig, views: &BTreeMap<String, View>) -> Vec<Problem> {
+    let mut problems = Vec::new();
+    for (index, item) in config.navigation.iter().enumerate() {
+        for view in item.view.iter().chain(&item.views) {
+            if !views.contains_key(view) {
+                problems.push(Problem::new(
+                    format!("config.navigation[{index}]"),
+                    format!("unknown view {view:?}"),
+                ));
+            }
+        }
+    }
+    problems
+}
+
+#[must_use]
+pub fn validate_site_config(config: &SiteConfig) -> Vec<Problem> {
+    let mut problems = Vec::new();
+    if config.version != FORMAT_VERSION {
+        problems.push(Problem::new(
+            "site.version",
+            format!(
+                "unsupported format version {}; expected {FORMAT_VERSION}",
+                config.version
+            ),
+        ));
+    }
+    if let Some(url) = &config.url
+        && !url.starts_with("http://")
+        && !url.starts_with("https://")
+    {
+        problems.push(Problem::new("site.url", "must be an absolute http(s) URL"));
+    }
     problems
 }
 
@@ -485,7 +628,10 @@ pub fn validate_model(model: &Model) -> Vec<Problem> {
     problems
 }
 
-fn valid_output_template(template: &str) -> bool {
+/// A safe project-relative path template with `{field}` placeholders, as used
+/// by model outputs and site permalinks.
+#[must_use]
+pub fn valid_output_template(template: &str) -> bool {
     if !is_safe_relative(template) {
         return false;
     }
@@ -668,5 +814,100 @@ mod tests {
         assert!(is_safe_relative("content/body.md"));
         assert!(!is_safe_relative("../secret"));
         assert!(!is_safe_relative("/absolute"));
+    }
+
+    fn config_with(theme: Theme, navigation: Vec<NavItem>) -> ProjectConfig {
+        ProjectConfig {
+            version: FORMAT_VERSION,
+            name: "demo".to_owned(),
+            description: None,
+            theme,
+            navigation,
+        }
+    }
+
+    fn nav(label: Option<&str>, view: Option<&str>, views: &[&str]) -> NavItem {
+        NavItem {
+            label: label.map(str::to_owned),
+            view: view.map(str::to_owned),
+            views: views.iter().map(|v| (*v).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn accepts_valid_theme_and_navigation() {
+        let config = config_with(
+            Theme {
+                accent: Some("#245c47".to_owned()),
+                sidebar: Some("#17231E".to_owned()),
+                background: None,
+            },
+            vec![
+                nav(None, Some("posts"), &[]),
+                nav(Some("Episodes"), None, &["episodes", "timeline"]),
+            ],
+        );
+        assert!(validate_config(&config).is_empty());
+    }
+
+    #[test]
+    fn rejects_malformed_theme_colors() {
+        for bad in ["245c47", "#245c4", "#245c477", "#245c4g"] {
+            let config = config_with(
+                Theme {
+                    accent: Some(bad.to_owned()),
+                    sidebar: None,
+                    background: None,
+                },
+                Vec::new(),
+            );
+            assert_eq!(
+                validate_config(&config).len(),
+                1,
+                "{bad} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_navigation_items() {
+        for (item, expected) in [
+            (nav(None, Some("a"), &["b"]), "not both"),
+            (nav(None, None, &[]), "requires a view"),
+            (nav(None, None, &["a", "b"]), "require a label"),
+        ] {
+            let problems = validate_config(&config_with(Theme::default(), vec![item]));
+            assert!(
+                problems.iter().any(|p| p.message.contains(expected)),
+                "expected {expected:?} in {problems:?}"
+            );
+        }
+        let problems = validate_config(&config_with(
+            Theme::default(),
+            vec![nav(None, Some("a"), &[]), nav(Some("G"), None, &["a"])],
+        ));
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.message.contains("more than once"))
+        );
+    }
+
+    #[test]
+    fn navigation_views_must_exist() {
+        let config = config_with(Theme::default(), vec![nav(None, Some("missing"), &[])]);
+        let problems = validate_navigation(&config, &BTreeMap::new());
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].message.contains("missing"));
+    }
+
+    #[test]
+    fn site_config_defaults_are_valid() {
+        assert!(validate_site_config(&SiteConfig::default()).is_empty());
+        let bad = SiteConfig {
+            url: Some("ftp://example.com".to_owned()),
+            ..SiteConfig::default()
+        };
+        assert_eq!(validate_site_config(&bad).len(), 1);
     }
 }

@@ -6,8 +6,10 @@ use serde_yaml::{Mapping, Value};
 use crate::WorkspaceError;
 use crate::yaml_edit::update_mapping;
 
+/// A Markdown file with optional YAML frontmatter, parsed with the same rules
+/// as record documents (also used for site pages).
 #[derive(Debug, Default)]
-pub(crate) struct MarkdownDocument {
+pub struct MarkdownDocument {
     pub frontmatter: Mapping,
     pub frontmatter_source: String,
     pub body: String,
@@ -26,7 +28,7 @@ impl MarkdownDocument {
         Self::parse(&contents, path)
     }
 
-    fn parse(contents: &str, path: &Path) -> Result<Self, WorkspaceError> {
+    pub fn parse(contents: &str, path: &Path) -> Result<Self, WorkspaceError> {
         let mut lines = contents.split_inclusive('\n');
         let Some(first) = lines.next() else {
             return Ok(Self::default());
@@ -82,6 +84,7 @@ impl MarkdownDocument {
         })
     }
 
+    #[must_use]
     pub fn render(&self, force_frontmatter: bool) -> String {
         if !force_frontmatter && !self.had_frontmatter && self.frontmatter.is_empty() {
             return self.body.clone();
