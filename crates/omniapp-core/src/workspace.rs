@@ -2002,6 +2002,7 @@ mod tests {
                 path: "books/{slug}".into(),
             },
             fields: BTreeMap::new(),
+            parent: None,
             outputs: BTreeMap::new(),
             display: BTreeMap::new(),
         };
@@ -2014,6 +2015,7 @@ mod tests {
                 path: "notes/{slug}.md".into(),
             },
             fields: BTreeMap::new(),
+            parent: None,
             outputs: BTreeMap::new(),
             display: BTreeMap::new(),
         };
@@ -2062,6 +2064,7 @@ mod tests {
                     ),
                 ),
             ]),
+            parent: None,
             outputs: BTreeMap::new(),
             display: BTreeMap::new(),
         };
@@ -2136,6 +2139,7 @@ mod tests {
                     },
                 ),
             )]),
+            parent: None,
             outputs: BTreeMap::new(),
             display: BTreeMap::new(),
         };
@@ -2211,6 +2215,7 @@ mod tests {
                     ),
                 ),
             ]),
+            parent: None,
             outputs: BTreeMap::from([
                 ("publication".into(), "build/{slug}/book-{slug}.pdf".into()),
                 (
@@ -2374,6 +2379,7 @@ mod tests {
                     ),
                 ),
             ]),
+            parent: None,
             outputs: BTreeMap::new(),
             display: BTreeMap::new(),
         };
@@ -2454,6 +2460,7 @@ mod tests {
                     field(FieldType::Text, false, FieldSource::Markdown { file: None }),
                 ),
             ]),
+            parent: None,
             outputs: BTreeMap::new(),
             display: BTreeMap::new(),
         };
@@ -2562,6 +2569,7 @@ mod tests {
                     ),
                 ),
             ]),
+            parent: None,
             outputs: BTreeMap::new(),
             display: BTreeMap::new(),
         };
@@ -2609,6 +2617,7 @@ mod tests {
                     ),
                 ),
             ]),
+            parent: None,
             outputs: BTreeMap::new(),
             display: BTreeMap::new(),
         };

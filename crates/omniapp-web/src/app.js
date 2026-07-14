@@ -96,15 +96,19 @@ async function boot() {
   document.addEventListener('click', e => {
     const button = e.target.closest('.copy-btn');
     if (button) { e.preventDefault(); handleCopyClick(button); return; }
-    const toggle = e.target.closest('.expand-toggle');
-    if (toggle) {
+    // Expandable rows toggle anywhere on the row except real links.
+    const row = e.target.closest('tr.expand-row');
+    if (row && !e.target.closest('a')) {
       e.preventDefault();
-      const detail = toggle.closest('tr')?.nextElementSibling;
+      const detail = row.nextElementSibling;
       if (!detail?.classList.contains('expand-detail')) return;
+      const toggle = row.querySelector('.expand-toggle');
       const open = detail.hidden;
       detail.hidden = !open;
-      toggle.textContent = open ? '▾' : '▸';
-      toggle.setAttribute('aria-expanded', String(open));
+      if (toggle) {
+        toggle.textContent = open ? '▾' : '▸';
+        toggle.setAttribute('aria-expanded', String(open));
+      }
     }
   });
   document.addEventListener('change', e => {
@@ -741,7 +745,8 @@ function resourceNode(node, ctx, vars) {
       : Object.keys(related.fields).slice(0, 3).map(field => ({ field }));
     const expandable = (node.expand || []).length > 0;
     const head = (expandable ? '<th class="expand-cell"></th>' : '') + columns.map(c =>
-      `<th>${esc(c.label || related.fields[c.field]?.label || c.field)}</th>`).join('');
+      `<th>${esc(c.label || related.fields[c.field]?.label || c.field)}</th>`).join('') +
+      (expandable ? '<th class="details-cell"></th>' : '');
     const rows = records.map(r => {
       const cells = columns.map((c, i) => {
         const raw = c.field.startsWith('meta.') ? metaValue(r, c.field) : r.values[c.field];
@@ -749,7 +754,11 @@ function resourceNode(node, ctx, vars) {
           ? formatFieldValue(raw, related.fields[c.field], c, { model: related, record: r })
           : formatValue(raw, related.fields[c.field]);
         const inner = raw == null || raw === '' ? '<span class="dash">—</span>' : formatted;
-        return i === 0 ? `<td><a class="cell" href="${recordHref(r)}">${inner}</a></td>` : `<td class="plain">${inner}</td>`;
+        // Expandable rows toggle on click, so the record link moves to a
+        // Details cell instead of wrapping the first column.
+        return i === 0 && !expandable
+          ? `<td><a class="cell" href="${recordHref(r)}">${inner}</a></td>`
+          : `<td class="plain">${inner}</td>`;
       }).join('');
       if (!expandable) return `<tr>${cells}</tr>`;
       // Detail rendered up front (hidden) so markdown placeholders hydrate in
@@ -757,8 +766,9 @@ function resourceNode(node, ctx, vars) {
       const detailCtx = { model: related, record: r, rels: null, outs: null, outboundByField: new Map(), depth: ctx.depth + 1 };
       const detail = (node.expand || []).map(n => renderNode(n, detailCtx)).join('');
       const toggle = `<td class="plain expand-cell"><button class="expand-toggle" type="button" aria-expanded="false">▸</button></td>`;
-      return `<tr>${toggle}${cells}</tr>` +
-        `<tr class="expand-detail" hidden><td class="plain" colspan="${columns.length + 1}">${detail}</td></tr>`;
+      const details = `<td class="plain details-cell"><a class="d-action" href="${recordHref(r)}">Details</a></td>`;
+      return `<tr class="expand-row">${toggle}${cells}${details}</tr>` +
+        `<tr class="expand-detail" hidden><td class="plain" colspan="${columns.length + 2}">${detail}</td></tr>`;
     }).join('');
     body = `<div class="table-shell mini"><table><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table></div>`;
   } else { // item
@@ -1129,22 +1139,51 @@ async function showRecord(modelName, key, prefetched) {
         ? api(`/api/models/${encodeURIComponent(modelName)}/record/outputs?key=${encodeURIComponent(key)}`).catch(() => ({ outputs: [] }))
         : Promise.resolve({ outputs: [] }),
     ]);
+    const crumbs = await breadcrumbTrail(model, rels);
     if (t !== reqToken) return;
-    renderRecord(model, record, rels, outs);
+    renderRecord(model, record, rels, outs, crumbs);
   } catch (e) {
     if (t !== reqToken) return;
     fatal(e.message);
   }
 }
 
-function renderRecord(model, record, rels, outs) {
+// The ancestor chain for a nested model (model.parent names the reference
+// field), nearest parent last. Each hop past the first needs that ancestor's
+// own relationships to find the next parent up.
+async function breadcrumbTrail(model, rels) {
+  const crumbs = [];
+  let currentModel = model;
+  let currentRels = rels;
+  for (let depth = 0; depth < 5; depth++) {
+    const parentField = currentModel.parent;
+    if (!parentField) break;
+    const link = (currentRels?.outbound || []).find(l => l.field === parentField);
+    if (!link) break;
+    const parentModel = state.project.models[link.record.model];
+    if (!parentModel) break;
+    crumbs.unshift({ record: link.record, model: parentModel });
+    if (!parentModel.parent) break;
+    currentModel = parentModel;
+    currentRels = await api(`/api/models/${encodeURIComponent(link.record.model)}/record/relationships?key=${encodeURIComponent(link.record.key)}`).catch(() => null);
+    if (!currentRels) break;
+  }
+  return crumbs;
+}
+
+function renderRecord(model, record, rels, outs, crumbs = []) {
   resetPageDynamics();
   const title = recordTitle(record, model);
   const actions =
     `<a class="btn" href="${recordHref(record)}/edit">Edit</a>` +
     `<button class="btn danger" id="deleteBtn">Delete</button>`;
   setHeader(title, '', actions);
-  $('#subtitle').innerHTML = `<span class="badge plain">${esc(model.label || model.name)}</span>`;
+  const trail = crumbs.length
+    ? `<span class="crumbs">${crumbs.map(c =>
+        `<a href="${recordHref(c.record)}">${esc(recordTitle(c.record, c.model))}</a>`
+      ).join('<span class="crumb-sep">›</span>')}<span class="crumb-sep">›</span></span>`
+    : '';
+  $('#subtitle').innerHTML = `${trail}<span class="badge plain">${esc(model.label || model.name)}</span>`;
 
   // Outbound reference links, resolved to canonical records where the
   // relationships endpoint gives us a match on field name.

@@ -99,6 +99,12 @@ pub struct Model {
     #[serde(default)]
     pub description: Option<String>,
     pub storage: Storage,
+    /// The reference field this model's records nest under. A nested model
+    /// belongs to its parent record: the admin renders breadcrumbs through
+    /// the parent chain, and the model is reached via its parent's pages
+    /// rather than top-level navigation.
+    #[serde(default)]
+    pub parent: Option<String>,
     pub fields: BTreeMap<String, Field>,
     #[serde(default)]
     pub outputs: BTreeMap<String, OutputSpec>,
@@ -535,6 +541,18 @@ pub fn validate_model(model: &Model) -> Vec<Problem> {
             format!("{location}.storage.path"),
             "contains malformed or ambiguous placeholders",
         ));
+    }
+    if let Some(parent) = &model.parent {
+        let is_reference = model
+            .fields
+            .get(parent)
+            .is_some_and(|field| field.field_type == FieldType::Reference);
+        if !is_reference {
+            problems.push(Problem::new(
+                format!("{location}.parent"),
+                format!("parent {parent:?} must name a reference field"),
+            ));
+        }
     }
     let placeholders = path_placeholders(storage_path);
     for placeholder in &placeholders {

@@ -261,11 +261,20 @@ pre.json { background:#fafbf9; border:1px solid var(--line); border-radius:8px; 
 div.output-file { padding:2px 0 }
 
 /* Expandable resource rows */
-th.expand-cell, td.expand-cell { width:28px; padding-right:0 }
+th.expand-cell, td.expand-cell { width:34px; padding-right:0 }
+th.details-cell, td.details-cell { width:1%; text-align:right; white-space:nowrap }
+tr.expand-row { cursor:pointer }
+tr.expand-row:hover td { background:#f4f6f3 }
 .expand-toggle { border:0; background:none; cursor:pointer; color:var(--muted);
-  font-size:12px; padding:2px 6px; border-radius:5px }
+  font-size:17px; line-height:1; padding:2px 7px; border-radius:5px }
 .expand-toggle:hover { color:var(--accent); background:#eef1ee }
-tr.expand-detail > td { padding:4px 14px 14px 34px; background:#fbfcfa }
+tr.expand-detail > td { padding:4px 14px 14px 40px; background:#fbfcfa }
+
+/* Breadcrumbs */
+.crumbs { display:inline-flex; align-items:center; gap:6px; margin-right:8px }
+.crumbs a { color:var(--muted); text-decoration:none; font-size:13px }
+.crumbs a:hover { color:var(--accent); text-decoration:underline }
+.crumb-sep { color:#c2c9c3; font-size:12px }
 
 /* ---------- Assets ---------- */
 .asset-thumb { display:block; width:64px; height:44px; object-fit:cover; border-radius:6px;
