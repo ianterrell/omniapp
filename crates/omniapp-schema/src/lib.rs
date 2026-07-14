@@ -111,12 +111,47 @@ pub struct Model {
     /// required string field with a value, then the record key.
     #[serde(default)]
     pub title: Option<String>,
+    /// URL segment for Rails-style nested admin routes. A root model renders
+    /// at `#/<route>/<identity>`; a nested model (see `parent`) chains under
+    /// its parent: `#/books/<book>/docs/<name>`.
+    #[serde(default)]
+    pub route: Option<String>,
+    /// The field whose value identifies a record in URLs (unique among
+    /// siblings). Records fall back to their key when unset.
+    #[serde(default)]
+    pub identity: Option<String>,
+    /// Record-page sub-navigation. Each tab renders one of the model's
+    /// display blocks in the record's context; the first tab is the default.
+    #[serde(default)]
+    pub tabs: Vec<Tab>,
     pub fields: BTreeMap<String, Field>,
     #[serde(default)]
     pub outputs: BTreeMap<String, OutputSpec>,
     /// Named display blocks; `detail` lays out the record page.
     #[serde(default)]
     pub display: BTreeMap<String, DisplayBlock>,
+}
+
+/// One tab of a record page's sub-navigation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Tab {
+    pub label: String,
+    /// The display block this tab renders ("detail" also allows the built-in
+    /// default page when no such block is defined).
+    pub block: String,
+    /// URL segment for the tab; defaults to the block name. The first tab
+    /// lives at the record's bare URL. A tab route may match a nested child
+    /// model's route so the collection tab and member pages share a path.
+    #[serde(default)]
+    pub route: Option<String>,
+}
+
+impl Tab {
+    #[must_use]
+    pub fn route(&self) -> &str {
+        self.route.as_deref().unwrap_or(&self.block)
+    }
 }
 
 /// A named generated output: either a bare path template (a single file, the
@@ -475,6 +510,75 @@ fn is_hex_color(color: &str) -> bool {
     color.len() == 7 && color.starts_with('#') && color[1..].chars().all(|c| c.is_ascii_hexdigit())
 }
 
+fn valid_route_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// Cross-model checks for nested routes: root routes must be unique, a routed
+/// child needs a routed parent chain, sibling routes must not collide, and the
+/// child's back-reference must target the parent's identity field so URL
+/// segments resolve records.
+#[must_use]
+pub fn validate_routes(models: &BTreeMap<String, Model>) -> Vec<Problem> {
+    let mut problems = Vec::new();
+    let mut root_routes: BTreeMap<&str, &str> = BTreeMap::new();
+    let mut child_routes: BTreeMap<(&str, &str), &str> = BTreeMap::new();
+    for model in models.values() {
+        let Some(route) = &model.route else { continue };
+        let location = format!("model {}.route", model.name);
+        let Some(parent_field) = &model.parent else {
+            if let Some(other) = root_routes.insert(route, &model.name) {
+                problems.push(Problem::new(
+                    &location,
+                    format!("route {route:?} is already used by model {other}"),
+                ));
+            }
+            continue;
+        };
+        let Some(reference) = model
+            .fields
+            .get(parent_field)
+            .and_then(|field| field.reference.as_ref())
+        else {
+            continue; // parent shape problems are reported by validate_model
+        };
+        let Some(parent) = models.get(&reference.model) else {
+            continue;
+        };
+        if parent.route.is_none() {
+            problems.push(Problem::new(
+                &location,
+                format!(
+                    "nested route needs a route on parent model {}",
+                    parent.name
+                ),
+            ));
+        }
+        if parent.identity.as_deref() != Some(reference.field.as_str()) {
+            problems.push(Problem::new(
+                &location,
+                format!(
+                    "parent model {} must declare identity: {} (the back-reference target) for URL segments to resolve",
+                    parent.name, reference.field
+                ),
+            ));
+        }
+        if let Some(other) = child_routes.insert((reference.model.as_str(), route), &model.name) {
+            problems.push(Problem::new(
+                &location,
+                format!(
+                    "route {route:?} under {} is already used by model {other}",
+                    reference.model
+                ),
+            ));
+        }
+    }
+    problems
+}
+
 /// Validate navigation entries against the set of loaded views.
 #[must_use]
 pub fn validate_navigation(config: &ProjectConfig, views: &BTreeMap<String, View>) -> Vec<Problem> {
@@ -567,6 +671,53 @@ pub fn validate_model(model: &Model) -> Vec<Problem> {
             format!("{location}.title"),
             format!("title {title:?} must name a field"),
         ));
+    }
+    if let Some(route) = &model.route {
+        if !valid_route_segment(route) {
+            problems.push(Problem::new(
+                format!("{location}.route"),
+                "route must be lowercase [a-z0-9-]+",
+            ));
+        }
+        if matches!(route.as_str(), "records" | "views" | "edit" | "new") {
+            problems.push(Problem::new(
+                format!("{location}.route"),
+                format!("route {route:?} is reserved"),
+            ));
+        }
+    }
+    if let Some(identity) = &model.identity
+        && !model.fields.contains_key(identity)
+    {
+        problems.push(Problem::new(
+            format!("{location}.identity"),
+            format!("identity {identity:?} must name a field"),
+        ));
+    }
+    let mut tab_routes = BTreeSet::new();
+    for (index, tab) in model.tabs.iter().enumerate() {
+        let tab_location = format!("{location}.tabs[{index}]");
+        if tab.label.trim().is_empty() {
+            problems.push(Problem::new(&tab_location, "label must not be empty"));
+        }
+        if tab.block != "detail" && !model.display.contains_key(&tab.block) {
+            problems.push(Problem::new(
+                &tab_location,
+                format!("no display block {:?}", tab.block),
+            ));
+        }
+        if !valid_route_segment(tab.route()) || matches!(tab.route(), "edit" | "new") {
+            problems.push(Problem::new(
+                &tab_location,
+                "tab route must be lowercase [a-z0-9-]+ and not reserved",
+            ));
+        }
+        if !tab_routes.insert(tab.route().to_owned()) {
+            problems.push(Problem::new(
+                &tab_location,
+                format!("duplicate tab route {:?}", tab.route()),
+            ));
+        }
     }
     let placeholders = path_placeholders(storage_path);
     for placeholder in &placeholders {
@@ -914,6 +1065,68 @@ mod tests {
         assert!(is_safe_relative("content/body.md"));
         assert!(!is_safe_relative("../secret"));
         assert!(!is_safe_relative("/absolute"));
+    }
+
+    #[test]
+    fn validates_nested_routes() {
+        let book: Model = serde_yaml::from_str(
+            r#"
+version: 1
+name: Book
+storage: { kind: directory, path: "books/{slug}" }
+route: books
+identity: slug
+fields:
+  slug: { type: string, source: { kind: path, variable: slug } }
+"#,
+        )
+        .unwrap();
+        let doc: Model = serde_yaml::from_str(
+            r#"
+version: 1
+name: BookDoc
+storage: { kind: file, path: "books/{book}/docs/{name}.md" }
+parent: book
+route: docs
+identity: name
+fields:
+  book:
+    type: reference
+    source: { kind: path, variable: book }
+    reference: { model: Book, field: slug }
+  name: { type: string, source: { kind: path, variable: name } }
+"#,
+        )
+        .unwrap();
+        let models = BTreeMap::from([
+            ("Book".to_owned(), book.clone()),
+            ("BookDoc".to_owned(), doc.clone()),
+        ]);
+        assert_eq!(validate_routes(&models), Vec::new());
+
+        // Same root route on two models collides.
+        let mut clash = book.clone();
+        clash.name = "Novel".to_owned();
+        let models = BTreeMap::from([
+            ("Book".to_owned(), book.clone()),
+            ("Novel".to_owned(), clash),
+            ("BookDoc".to_owned(), doc.clone()),
+        ]);
+        assert!(
+            validate_routes(&models)
+                .iter()
+                .any(|p| p.message.contains("already used"))
+        );
+
+        // A routed child needs the parent's identity to match its back-reference.
+        let mut unkeyed = book;
+        unkeyed.identity = None;
+        let models = BTreeMap::from([("Book".to_owned(), unkeyed), ("BookDoc".to_owned(), doc)]);
+        assert!(
+            validate_routes(&models)
+                .iter()
+                .any(|p| p.message.contains("must declare identity"))
+        );
     }
 
     fn config_with(theme: Theme, navigation: Vec<NavItem>) -> ProjectConfig {

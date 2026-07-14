@@ -90,6 +90,7 @@ async function boot() {
   $('#projectDesc').textContent = cfg.description || '';
   applyTheme(cfg.theme);
   buildNav();
+  buildRouteTables();
   window.addEventListener('hashchange', router);
   // Delegated handlers for display-DSL dynamics (copy buttons, checklists,
   // expandable resource rows).
@@ -229,6 +230,24 @@ function renderSubnav(viewName) {
  * Router
  * ====================================================================== */
 
+/* Nested-route tables (Rails-style): a root model's `route` claims a first
+ * segment; a nested model's `route` claims a segment under its parent. */
+const rootRoutes = new Map();   // 'books' → 'Book'
+const childRoutes = new Map();  // 'Book' → Map('docs' → 'BookDoc')
+
+function buildRouteTables() {
+  rootRoutes.clear();
+  childRoutes.clear();
+  for (const m of Object.values(state.project.models)) {
+    if (!m.route) continue;
+    if (!m.parent) { rootRoutes.set(m.route, m.name); continue; }
+    const ref = m.fields[m.parent]?.reference;
+    if (!ref) continue;
+    if (!childRoutes.has(ref.model)) childRoutes.set(ref.model, new Map());
+    childRoutes.get(ref.model).set(m.route, m.name);
+  }
+}
+
 function router() {
   const raw = location.hash.replace(/^#\/?/, '');
   const [pathPart, queryPart] = raw.split('?');
@@ -237,6 +256,11 @@ function router() {
   const dec = s => { try { return decodeURIComponent(s); } catch { return s; } };
 
   if (!seg.length) { const d = defaultRoute(); if (d) { location.hash = d; } return; }
+
+  if (rootRoutes.has(dec(seg[0]))) {
+    routeNested(seg.map(dec));
+    return;
+  }
 
   if (seg[0] === 'views') {
     const name = dec(seg[1] || '');
@@ -256,6 +280,65 @@ function router() {
     return;
   }
   fatal('Unknown route: ' + esc(raw));
+}
+
+// Walk a nested route: /books/rude/docs/idea[/tab-or-edit]. Segments resolve
+// records pairwise (route + identity); one trailing segment is a tab of the
+// final record, or `edit`.
+async function routeNested(segs) {
+  const t = ++reqToken;
+  setHeader('Loading…', '', '');
+  $('#page').innerHTML = '<div class="loading">Loading record…</div>';
+  try {
+    if (segs.length < 2) { fatal('Missing record identifier.'); return; }
+    let modelName = rootRoutes.get(segs[0]);
+    let record = await findByIdentity(modelName, null, segs[1]);
+    let i = 2;
+    let tab = null;
+    while (i < segs.length) {
+      const s = segs[i];
+      const model = state.project.models[modelName];
+      if (i === segs.length - 1) {
+        if (s === 'edit') { if (t === reqToken) showEdit(modelName, record.key); return; }
+        const match = (model.tabs || []).find(tb => (tb.route || tb.block) === s);
+        if (match) { tab = tb_route(match); i += 1; continue; }
+      }
+      const childModel = childRoutes.get(modelName)?.get(s);
+      if (!childModel || i + 1 >= segs.length) { fatal(`Unknown route segment “${esc(s)}”.`); return; }
+      record = await findByIdentity(childModel, modelName, segs[i + 1], record);
+      modelName = childModel;
+      i += 2;
+    }
+    if (t !== reqToken) return;
+    showRecord(modelName, record.key, record, tab);
+  } catch (e) {
+    if (t !== reqToken) return;
+    fatal(e.message);
+  }
+}
+
+function tb_route(tab) { return tab.route || tab.block; }
+
+// One record by its URL identity, scoped to its parent when nested. The
+// parent scope filter uses the parent record's identity value, which is what
+// the child's back-reference stores (enforced by route validation).
+async function findByIdentity(modelName, parentModelName, value, parentRecord) {
+  const model = state.project.models[modelName];
+  if (!model.identity) {
+    return api(`/api/models/${encodeURIComponent(modelName)}/record?key=${encodeURIComponent(value)}`);
+  }
+  const filters = [{ field: model.identity, op: 'eq', value }];
+  if (parentModelName && parentRecord) {
+    const parentModel = state.project.models[parentModelName];
+    const scope = parentModel.identity ? parentRecord.values[parentModel.identity] : parentRecord.key;
+    filters.push({ field: model.parent, op: 'eq', value: scope });
+  }
+  const res = await api(`/api/models/${encodeURIComponent(modelName)}/records?page=1&page_size=2&filter=${encodeURIComponent(JSON.stringify(filters))}`);
+  if (!res.records?.length) {
+    const label = state.project.models[modelName].label || modelName;
+    throw new Error(`No ${label.toLowerCase().replace(/s$/, '')} “${value}”.`);
+  }
+  return res.records[0];
 }
 
 // Resolve a reference value to a canonical record, then rewrite the URL.
@@ -314,7 +397,33 @@ function recordTitle(record, model) {
 }
 
 function recordHref(record) {
-  return `#/records/${encodeURIComponent(record.model)}/${encodeURIComponent(record.key)}`;
+  return nestedHref(record) || `#/records/${encodeURIComponent(record.model)}/${encodeURIComponent(record.key)}`;
+}
+
+// Canonical Rails-style URL (#/books/rude/docs/idea), derivable purely from
+// the record's own values: every ancestor's URL segment is the value some
+// field on THIS record stores by referencing that ancestor at its identity
+// field. Returns null when the chain isn't fully routed or derivable.
+function nestedHref(record) {
+  const models = state.project?.models || {};
+  const model = models[record.model];
+  if (!model?.route) return null;
+  const leaf = model.identity ? record.values[model.identity] : record.key;
+  if (leaf == null || leaf === '') return null;
+  let segs = [model.route, String(leaf)];
+  let cur = model;
+  for (let depth = 0; depth < 6 && cur.parent; depth++) {
+    const ancestor = models[cur.fields[cur.parent]?.reference?.model];
+    if (!ancestor?.route || !ancestor.identity) return null;
+    const source = Object.entries(model.fields).find(([, d]) =>
+      d.reference?.model === ancestor.name && d.reference.field === ancestor.identity && !d.reference.many);
+    const value = source && record.values[source[0]];
+    if (value == null || value === '' || typeof value === 'object') return null;
+    segs = [ancestor.route, String(value), ...segs];
+    cur = ancestor;
+  }
+  if (cur.parent) return null;
+  return '#/' + segs.map(encodeURIComponent).join('/');
 }
 
 function assetUrl(path) { return '/files/' + String(path).split('/').map(encodeURIComponent).join('/'); }
@@ -1150,7 +1259,7 @@ function renderTree(view, model, records) {
  * Record detail
  * ====================================================================== */
 
-async function showRecord(modelName, key, prefetched) {
+async function showRecord(modelName, key, prefetched, activeTab) {
   const t = ++reqToken;
   const model = state.project.models[modelName];
   if (!model) { fatal(`Unknown model “${esc(modelName)}”.`); return; }
@@ -1171,7 +1280,12 @@ async function showRecord(modelName, key, prefetched) {
     ]);
     const crumbs = await breadcrumbTrail(model, rels);
     if (t !== reqToken) return;
-    renderRecord(model, record, rels, outs, crumbs);
+    // Legacy #/records/ URLs rewrite themselves to the canonical nested URL.
+    const canonical = nestedHref(record);
+    if (canonical && location.hash.startsWith('#/records/')) {
+      history.replaceState(null, '', canonical + (activeTab ? '/' + encodeURIComponent(activeTab) : ''));
+    }
+    renderRecord(model, record, rels, outs, crumbs, activeTab);
   } catch (e) {
     if (t !== reqToken) return;
     fatal(e.message);
@@ -1201,7 +1315,7 @@ async function breadcrumbTrail(model, rels) {
   return crumbs;
 }
 
-function renderRecord(model, record, rels, outs, crumbs = []) {
+function renderRecord(model, record, rels, outs, crumbs = [], activeTab = null) {
   resetPageDynamics();
   const title = recordTitle(record, model);
   const actions =
@@ -1223,15 +1337,31 @@ function renderRecord(model, record, rels, outs, crumbs = []) {
     (outboundByField.get(link.field) || outboundByField.set(link.field, []).get(link.field)).push(link.record);
   }
 
-  // A `detail` display block lays out the whole page (including any related
-  // records and outputs the author wants). Without one, the default is a
-  // stacked label-over-value grid plus the automatic related/outputs sections.
-  const detail = model.display?.detail;
+  // With tabs, each tab renders one display block and the first tab is the
+  // default. Without them, a `detail` display block lays out the whole page;
+  // without that, the default is a stacked label-over-value grid plus the
+  // automatic related/outputs sections.
   const ctx = { model, record, rels, outs, outboundByField, depth: 0 };
-  const inner = detail
-    ? blockNodes(detail).map(node => renderNode(node, ctx)).join('')
-    : defaultDetail(model, record, ctx) + relatedSection(model, rels) + outputsSection(model, outs);
-  $('#page').innerHTML = `<div class="detail">${inner}</div>`;
+  const renderBlock = name => {
+    const block = model.display?.[name];
+    return block
+      ? blockNodes(block).map(node => renderNode(node, ctx)).join('')
+      : defaultDetail(model, record, ctx) + relatedSection(model, rels) + outputsSection(model, outs);
+  };
+  let tabsBar = '';
+  let inner;
+  if (model.tabs?.length) {
+    const base = recordHref(record);
+    const current = model.tabs.find(tb => tb_route(tb) === activeTab) || model.tabs[0];
+    tabsBar = `<div class="rec-tabs">` + model.tabs.map((tb, idx) => {
+      const href = idx === 0 ? base : `${base}/${encodeURIComponent(tb_route(tb))}`;
+      return `<a class="rec-tab${tb === current ? ' active' : ''}" href="${href}">${esc(tb.label)}</a>`;
+    }).join('') + `</div>`;
+    inner = renderBlock(current.block);
+  } else {
+    inner = renderBlock('detail');
+  }
+  $('#page').innerHTML = `${tabsBar}<div class="detail">${inner}</div>`;
   fillMarkdown();
 
   $('#deleteBtn').onclick = async () => {
@@ -1341,10 +1471,23 @@ function backToViewHref() {
 }
 function keepNavForRecord(modelName) {
   // Keep the sidebar/subnav from the view the user came from, if it targets
-  // this model; otherwise leave the current highlight as-is.
+  // this model. On direct hits, light up the first nav view showing the
+  // record's root ancestor (a changelog entry highlights the books view).
   if (state.view && state.view.model === modelName) {
     highlightNav(state.view.name);
     renderSubnav(state.view.name);
+    return;
+  }
+  const models = state.project.models;
+  let m = models[modelName];
+  for (let depth = 0; depth < 6 && m?.parent; depth++) {
+    m = models[m.fields[m.parent]?.reference?.model];
+  }
+  if (!m) return;
+  const view = Object.values(state.project.views).find(v => v.model === m.name);
+  if (view) {
+    highlightNav(view.name);
+    renderSubnav(view.name);
   }
 }
 

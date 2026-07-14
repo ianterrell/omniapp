@@ -277,6 +277,14 @@ tr.expand-detail > td { padding:4px 14px 14px 40px; background:#fbfcfa }
 .crumb-sep { color:#c2c9c3; font-size:12px }
 .crumb-current { color:var(--ink); font-size:13px }
 
+/* Record-page tabs */
+.rec-tabs { display:flex; gap:2px; margin:0 0 18px; border-bottom:1px solid var(--line); flex-wrap:wrap }
+.rec-tab { padding:8px 14px; color:var(--muted); text-decoration:none; font-size:13.5px;
+  border:1px solid transparent; border-bottom:none; border-radius:8px 8px 0 0; margin-bottom:-1px }
+.rec-tab:hover { color:var(--ink); background:var(--accent-soft) }
+.rec-tab.active { color:var(--ink); font-weight:600; background:var(--panel);
+  border-color:var(--line); border-bottom:1px solid var(--panel) }
+
 /* Runtime view filters */
 .filter-chip { display:inline-flex; align-items:center; gap:6px; padding:4px 10px;
   border:1px solid var(--line); border-radius:999px; background:var(--accent-soft);
