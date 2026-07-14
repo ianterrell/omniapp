@@ -279,13 +279,16 @@ pub fn outputs(path: &Path, model_name: &str, selector: &str, json: bool) -> Res
     } else {
         for output in outputs.outputs {
             let state = if output.is_file {
-                "file"
+                "file".to_owned()
             } else if output.is_directory {
-                "directory"
+                format!("directory, {} file(s)", output.files.len())
             } else {
-                "not generated"
+                "not generated".to_owned()
             };
             println!("  {}: {} ({state})", output.name, output.path.display());
+            for file in &output.files {
+                println!("    {file}");
+            }
         }
     }
     Ok(())

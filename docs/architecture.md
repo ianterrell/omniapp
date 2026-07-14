@@ -113,7 +113,8 @@ Startup reconciles the cache with the filesystem instead of rebuilding it: one p
 - Config-driven title and three-color theme; every derived shade is computed from the configured bases.
 - Two-tier navigation: curated sidebar entries, optional tab groups, hidden-but-addressable views.
 - Hash-routed record pages: a formatted read view with backreference tabs, full-page edit and create forms, deep links, and browser history. The modal editor is gone.
-- Dedicated renderers for every view type: table, board, calendar, gallery, timeline, tree, form, and custom.
+- Dedicated renderers for every view type: table, board, calendar, cards, timeline, tree, and form.
+- A per-model display DSL: named blocks of layout nodes (grid/stack/card/section/field/resource/outputs) with responsive breakpoint maps and declarative field formats. The `detail` block lays out the record page (markdown rendered server-side by the site renderer); other named blocks render records as items in lists and `resource` collections. Client-side actions: copy-to-clipboard, navigate, create-with-prefill, and in-place checklist toggles.
 - View-wide substring search executed in the SQLite cache alongside the view's filters.
 - Served on its own port at `/`; each public site gets its own port.
 
@@ -140,9 +141,9 @@ Startup reconciles the cache with the filesystem instead of rebuilding it: one p
 ### Product and extension work
 
 1. Add relationship traversal and backreference joins to declarative query filters, grouping, and ordering.
-2. Add Markdown rendering/preview to the admin record pages (the public site already renders Markdown), plus search result excerpts and highlighting.
+2. Add search result excerpts and highlighting (record pages already render Markdown via `format: markdown`).
 3. Embed `sqlite-vec`; define an embedding-provider interface, dimension changes, background indexing, and fully rebuildable semantic search.
-4. Add a sandboxed script host and event hooks (including view `actions`). Scripts must call application services rather than edit canonical files directly.
+4. Add a sandboxed script host and event hooks (giving the reserved `action_group` display node its meaning). Scripts must call application services rather than edit canonical files directly.
 5. Add listing-page pagination to the site generator (`views.*` and full record lists cover current needs).
 6. Add optional derived thumbnails/posters for very large media. Current previews stream original files and size them in the browser.
 7. Declare a stable project format when appropriate, then add migrations and a compatibility corpus.

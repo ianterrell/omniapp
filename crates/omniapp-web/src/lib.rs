@@ -8,7 +8,7 @@ use std::sync::{Arc, RwLock};
 use axum::extract::{Path, Query, Request, State};
 use axum::http::{StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use omniapp_core::{
     Cache, RecordInput, RecordsSnapshot, Workspace, WorkspaceError, WorkspaceWatcher,
@@ -146,6 +146,7 @@ fn admin_router(state: AppState) -> Router {
         .route("/api/models/{model}/record/outputs", get(record_outputs))
         .route("/api/views/{view}/records", get(view_records))
         .route("/api/search", get(search))
+        .route("/api/render/markdown", post(render_markdown))
         .route("/files/{*path}", get(project_asset))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -512,6 +513,22 @@ async fn search(
     Ok(Json(serde_json::to_value(
         cache.search(&params.q, params.limit.clamp(1, 500))?,
     )?))
+}
+
+#[derive(Deserialize)]
+struct MarkdownInput {
+    texts: Vec<String>,
+}
+
+/// Batch-render markdown for the admin's `format: markdown` fields and
+/// copy-as-HTML actions, using the same renderer as the generated sites.
+async fn render_markdown(Json(input): Json<MarkdownInput>) -> Json<Value> {
+    let html: Vec<String> = input
+        .texts
+        .iter()
+        .map(|text| omniapp_site::render_markdown(text))
+        .collect();
+    Json(json!({ "html": html }))
 }
 
 async fn project_asset(

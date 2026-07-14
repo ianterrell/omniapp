@@ -86,7 +86,6 @@ query:
     - field: title
       direction: asc
   page_size: 50
-actions: []
 ";
 
 const DEFAULT_LAYOUT: &str = r#"<!doctype html>

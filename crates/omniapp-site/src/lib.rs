@@ -30,6 +30,7 @@ use crate::render::Renderer;
 use crate::routes::{RenderSpec, Route, build_routes};
 
 pub use build::build;
+pub use env::render_markdown;
 
 /// Options controlling a site build.
 #[derive(Debug, Clone, Default)]

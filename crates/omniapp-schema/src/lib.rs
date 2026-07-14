@@ -1,5 +1,9 @@
 //! Declarative, stable-on-disk project format for OmniApp.
 
+mod display;
+
+pub use display::*;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -97,7 +101,68 @@ pub struct Model {
     pub storage: Storage,
     pub fields: BTreeMap<String, Field>,
     #[serde(default)]
-    pub outputs: BTreeMap<String, String>,
+    pub outputs: BTreeMap<String, OutputSpec>,
+    /// Named display blocks; `detail` lays out the record page.
+    #[serde(default)]
+    pub display: BTreeMap<String, DisplayBlock>,
+}
+
+/// A named generated output: either a bare path template (a single file, the
+/// common case) or a detailed form that can declare a directory whose actual
+/// contents are enumerated at resolve time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum OutputSpec {
+    /// Shorthand: a path template resolving to one generated file.
+    Path(String),
+    /// Full form with an explicit kind.
+    Detailed(OutputDetail),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutputDetail {
+    pub path: String,
+    #[serde(default)]
+    pub kind: OutputKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputKind {
+    #[default]
+    File,
+    Directory,
+}
+
+impl OutputSpec {
+    #[must_use]
+    pub fn path(&self) -> &str {
+        match self {
+            Self::Path(path) => path,
+            Self::Detailed(detail) => &detail.path,
+        }
+    }
+
+    #[must_use]
+    pub fn kind(&self) -> OutputKind {
+        match self {
+            Self::Path(_) => OutputKind::File,
+            Self::Detailed(detail) => detail.kind,
+        }
+    }
+}
+
+impl From<&str> for OutputSpec {
+    fn from(path: &str) -> Self {
+        Self::Path(path.to_owned())
+    }
+}
+
+impl From<String> for OutputSpec {
+    fn from(path: String) -> Self {
+        Self::Path(path)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -231,7 +296,7 @@ pub struct View {
     #[serde(default)]
     pub group_by: Option<String>,
     #[serde(default)]
-    pub actions: Vec<ViewAction>,
+    pub display: Option<ViewDisplay>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -242,9 +307,8 @@ pub enum ViewType {
     Tree,
     Board,
     Calendar,
-    Gallery,
+    Cards,
     Timeline,
-    Custom,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -300,15 +364,6 @@ pub enum Direction {
     #[default]
     Asc,
     Desc,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ViewAction {
-    pub name: String,
-    pub label: String,
-    #[serde(default)]
-    pub script: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -609,7 +664,8 @@ pub fn validate_model(model: &Model) -> Vec<Problem> {
             FieldSource::Path { .. } | FieldSource::Yaml { .. } | FieldSource::Asset { .. } => {}
         }
     }
-    for (name, path) in &model.outputs {
+    for (name, spec) in &model.outputs {
+        let path = spec.path();
         if !valid_output_template(path) || path.split('/').next() == Some(".omniapp") {
             problems.push(Problem::new(
                 format!("{location}.outputs.{name}"),
@@ -625,6 +681,7 @@ pub fn validate_model(model: &Model) -> Vec<Problem> {
             }
         }
     }
+    problems.extend(validate_model_display(model));
     problems
 }
 
@@ -712,6 +769,17 @@ pub fn validate_view(view: &View, models: &BTreeMap<String, Model>) -> Vec<Probl
         problems.push(Problem::new(
             format!("{location}.query.page_size"),
             "must be between 1 and 1000",
+        ));
+    }
+    if let Some(item) = view
+        .display
+        .as_ref()
+        .and_then(|display| display.item.as_ref())
+        && !model.display.contains_key(item)
+    {
+        problems.push(Problem::new(
+            format!("{location}.display.item"),
+            format!("model {} has no display block {item:?}", model.name),
         ));
     }
     problems

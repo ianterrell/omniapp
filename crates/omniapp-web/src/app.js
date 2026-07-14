@@ -9,6 +9,12 @@
  * A monotonically increasing request token (reqToken) guards against stale async
  * renders when the user navigates while a fetch is in flight. Every routed render
  * captures the token and bails after each await if a newer render has started.
+ *
+ * Record presentation is driven by the display DSL: models carry named blocks
+ * of layout nodes (grid/stack/card/section/field/resource/outputs) rendered by
+ * renderNode(). The `detail` block lays out the record page; other blocks
+ * render records wherever they appear in lists (view display.item → the
+ * model's `card` block → the built-in recordCard heuristic).
  */
 
 'use strict';
@@ -85,6 +91,15 @@ async function boot() {
   applyTheme(cfg.theme);
   buildNav();
   window.addEventListener('hashchange', router);
+  // Delegated handlers for display-DSL dynamics (copy buttons, checklists).
+  document.addEventListener('click', e => {
+    const button = e.target.closest('.copy-btn');
+    if (button) { e.preventDefault(); handleCopyClick(button); }
+  });
+  document.addEventListener('change', e => {
+    const box = e.target.closest('.check-toggle');
+    if (box) handleCheckToggle(box);
+  });
   if (!defaultRoute()) {
     setHeader(cfg.name || 'OmniApp', '', '');
     $('#page').innerHTML = '<div class="empty">No models or views are defined yet.</div>';
@@ -215,7 +230,7 @@ function router() {
   }
   if (seg[0] === 'records') {
     const model = dec(seg[1] || '');
-    if (seg[2] === 'new') { showCreate(model); return; }
+    if (seg[2] === 'new') { showCreate(model, query); return; }
     if (seg[2] === 'by') { resolveBy(model, dec(seg[3] || ''), dec(seg[4] || '')); return; }
     const key = dec(seg[2] || '');
     if (seg[3] === 'edit') { showEdit(model, key); return; }
@@ -354,6 +369,440 @@ function recordCard(record, model, fields) {
     `<div class="card-meta">${secondary}</div></a>`;
 }
 
+/* =========================================================================
+ * Display DSL — recursive renderer for model display blocks.
+ * ====================================================================== */
+
+const MAX_NODE_DEPTH = 8;
+const SPACE = { sm: '8px', md: '14px', lg: '22px', xl: '32px' };
+const BP_SUFFIX = { default: 'base', sm: 'sm', md: 'md', lg: 'lg', xl: 'xl' };
+
+// Per-render payload stores for delegated handlers (reset on every page build).
+let copyPayloads = [];
+let checkPayloads = [];
+let mdQueue = [];
+
+function resetPageDynamics() {
+  copyPayloads = [];
+  checkPayloads = [];
+  mdQueue = [];
+}
+
+// A block is one node or a list (implicit stack).
+function blockNodes(block) { return Array.isArray(block) ? block : [block]; }
+
+// Emit `--name-<bp>` custom properties for an int-or-breakpoint-map value.
+function responsiveVars(name, value, out) {
+  if (value == null) return;
+  if (typeof value === 'number') { out.push(`--${name}-base:${value}`); return; }
+  for (const [bp, suffix] of Object.entries(BP_SUFFIX)) {
+    if (value[bp] != null) out.push(`--${name}-${suffix}:${value[bp]}`);
+  }
+}
+
+function gapVars(gap, out) {
+  if (gap == null) return;
+  if (typeof gap === 'string') {
+    out.push(`--cgap:${SPACE[gap]}`, `--rgap:${SPACE[gap]}`);
+    return;
+  }
+  if (gap.column) out.push(`--cgap:${SPACE[gap.column]}`);
+  if (gap.row) out.push(`--rgap:${SPACE[gap.row]}`);
+}
+
+function styleAttr(vars) { return vars.length ? ` style="${vars.join(';')}"` : ''; }
+
+// Render one DSL node. ctx: { model, record, rels, outs, outboundByField,
+// depth } — rels/outs are null when a block renders as a collection item.
+function renderNode(node, ctx) {
+  if (!node || ctx.depth > MAX_NODE_DEPTH) return '';
+  const vars = [];
+  responsiveVars('span', node.span, vars);
+  const kids = children =>
+    (children || []).map(child => renderNode(child, ctx)).join('');
+  switch (node.type) {
+    case 'grid': {
+      responsiveVars('cols', node.columns, vars);
+      gapVars(node.gap, vars);
+      return `<div class="dgrid"${styleAttr(vars)}>${kids(node.children)}</div>`;
+    }
+    case 'stack': {
+      gapVars(node.gap, vars);
+      return `<div class="dstack"${styleAttr(vars)}>${kids(node.children)}</div>`;
+    }
+    case 'card': {
+      if (node.padding) vars.push(`--pad:${SPACE[node.padding]}`);
+      const title = node.title ? `<h3 class="d-heading">${esc(node.title)}</h3>` : '';
+      return `<div class="dcard"${styleAttr(vars)}>${title}${kids(node.children)}</div>`;
+    }
+    case 'section': {
+      return `<section class="dsection"${styleAttr(vars)}>` +
+        `<h3 class="d-heading">${esc(node.title)}</h3>${kids(node.children)}</section>`;
+    }
+    case 'divider':
+      return `<hr class="ddivider"${styleAttr(vars)}>`;
+    case 'field':
+      return fieldNode(node, ctx, vars);
+    case 'resource':
+      return resourceNode(node, ctx, vars);
+    case 'outputs':
+      return outputsNode(node, ctx, vars);
+    default:
+      return ''; // action_group (reserved) and anything unknown
+  }
+}
+
+function metaValue(record, name) {
+  return { 'meta.key': record.key, 'meta.path': record.path, 'meta.model': record.model }[name];
+}
+const META_LABELS = { 'meta.key': 'Key', 'meta.path': 'Path', 'meta.model': 'Model' };
+
+function fieldNode(node, ctx, vars) {
+  const names = node.name ? [node.name] : (node.fields || []);
+  const def = node.name ? ctx.model.fields[node.name] : null;
+  const raw = node.name
+    ? (node.name.startsWith('meta.') ? metaValue(ctx.record, node.name) : ctx.record.values[node.name])
+    : null;
+  const isEmpty = v => v == null || v === '' || (Array.isArray(v) && !v.length);
+
+  let value;
+  if (node.format === 'badge' || node.format === 'badges') {
+    const badges = names
+      .map(n => n.startsWith('meta.') ? metaValue(ctx.record, n) : ctx.record.values[n])
+      .filter(v => !isEmpty(v))
+      .flatMap(v => Array.isArray(v) ? v : [v])
+      .map(v => `<span class="badge plain">${esc(v)}</span>`)
+      .join('');
+    value = badges ? `<span class="badge-row">${badges}</span>` : null;
+  } else if (isEmpty(raw)) {
+    value = null;
+  } else {
+    value = formatFieldValue(raw, def, node, ctx);
+  }
+  if (value == null) value = `<span class="dash">${esc(node.empty ?? '—')}</span>`;
+
+  const actions = (node.actions || []).map(action => copyButton(action, raw)).join('');
+  if (node.format === 'title') {
+    return `<div class="kv"${styleAttr(vars)}><div class="d-title">${value}</div></div>`;
+  }
+  // `label: ""` suppresses the label row entirely (images, full-bleed prose).
+  const label = node.label
+    ?? def?.label
+    ?? META_LABELS[node.name]
+    ?? node.name
+    ?? '';
+  const head = label === '' && !actions ? '' : `<div class="k">${esc(label)}${actions}</div>`;
+  return `<div class="kv"${styleAttr(vars)}>${head}<div class="v">${value}</div></div>`;
+}
+
+function formatFieldValue(value, def, node, ctx) {
+  switch (node.format) {
+    case 'title': return esc(String(value));
+    case 'markdown': {
+      const index = mdQueue.push(String(value)) - 1;
+      return `<div class="prose" data-md="${index}">${esc(String(value))}</div>`;
+    }
+    case 'code': return `<code class="d-code">${esc(String(value))}</code>`;
+    case 'date': return esc(fmtDate(value, def?.type === 'date_time' ? 'date_time' : 'date'));
+    case 'relative_time': return relTime(value);
+    case 'chips': {
+      const items = listItems(value);
+      if (!items.length) return null; // → the node's `empty` placeholder
+      return `<span class="chip-row">${items.map(x => `<span class="chip">${esc(x)}</span>`).join('')}</span>`;
+    }
+    case 'list': {
+      const items = listItems(value);
+      if (!items.length) return null;
+      return `<ul class="d-list">${items.map(x => `<li>${esc(x)}</li>`).join('')}</ul>`;
+    }
+    case 'links': return linksHtml(value);
+    case 'template':
+      return esc(node.template || '').replace(/\{\{\s*value\s*\}\}/g, esc(String(value)));
+    case 'text': return detailValue(value, def || {}, node.name, ctx.outboundByField || new Map());
+    default: // type-derived
+      return detailValue(value, def || {}, node.name, ctx.outboundByField || new Map());
+  }
+}
+
+// Array-ish values as display strings, dropping blank entries.
+function listItems(value) {
+  const items = Array.isArray(value) ? value : [value];
+  return items
+    .map(x => x != null && typeof x === 'object' ? JSON.stringify(x) : String(x ?? ''))
+    .filter(s => s.trim() !== '');
+}
+
+// A JSON links value: {label: url}, [url, ...], or [{label, url}, ...].
+function linksHtml(value) {
+  let entries;
+  if (Array.isArray(value)) {
+    entries = value.map(v => (v && typeof v === 'object') ? [v.label ?? v.url, v.url] : [v, v]);
+  } else if (value && typeof value === 'object') {
+    entries = Object.entries(value);
+  } else {
+    entries = [[String(value), String(value)]];
+  }
+  return entries
+    .filter(([, url]) => url != null)
+    .map(([label, url]) =>
+      `<div class="d-link"><span class="k2">${esc(label)}:</span> ` +
+      `<a href="${esc(url)}" target="_blank" rel="noopener">${esc(url)}</a></div>`)
+    .join('');
+}
+
+function relTime(value) {
+  const d = new Date(value);
+  if (isNaN(d)) return esc(String(value));
+  const seconds = (Date.now() - d.getTime()) / 1000;
+  const abs = Math.abs(seconds);
+  const units = [[31536000, 'year'], [2592000, 'month'], [604800, 'week'],
+    [86400, 'day'], [3600, 'hour'], [60, 'minute']];
+  for (const [size, name] of units) {
+    if (abs >= size) {
+      const n = Math.floor(abs / size);
+      return esc(seconds >= 0 ? `${n} ${name}${n === 1 ? '' : 's'} ago` : `in ${n} ${name}${n === 1 ? '' : 's'}`);
+    }
+  }
+  return 'just now';
+}
+
+// `copy` field action → button resolved through the delegated click handler.
+function copyButton(action, raw) {
+  if (action.type !== 'copy' || raw == null) return '';
+  const index = copyPayloads.push({ value: raw, as: action.value || 'text' }) - 1;
+  return `<button type="button" class="copy-btn" data-copy="${index}">${esc(action.label || 'Copy')}</button>`;
+}
+
+async function handleCopyClick(button) {
+  const payload = copyPayloads[+button.dataset.copy];
+  if (!payload) return;
+  const { value, as } = payload;
+  let text;
+  try {
+    if (as === 'html') {
+      const res = await api('/api/render/markdown', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ texts: [String(value)] }),
+      });
+      text = res.html[0];
+    } else if (as === 'lines') {
+      text = (Array.isArray(value) ? value : [value]).map(String).join('\n');
+    } else if (as === 'json') {
+      text = JSON.stringify(value, null, 2);
+    } else {
+      text = typeof value === 'object' ? JSON.stringify(value) : String(value);
+    }
+    await navigator.clipboard.writeText(text);
+    const original = button.textContent;
+    button.textContent = 'Copied';
+    setTimeout(() => { button.textContent = original; }, 1200);
+  } catch (e) {
+    alert('Copy failed: ' + e.message);
+  }
+}
+
+// Checklist rows toggle their boolean via the merge semantics of the update
+// API (only the checked field is sent), then re-render the page.
+async function handleCheckToggle(box) {
+  const payload = checkPayloads[+box.dataset.check];
+  if (!payload) return;
+  const { record, field } = payload;
+  box.disabled = true;
+  try {
+    await api(`/api/models/${encodeURIComponent(record.model)}/record?key=${encodeURIComponent(record.key)}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ revision: record.revision, values: { [field]: box.checked } }),
+    });
+    router(); // refresh the page (records + revisions changed)
+  } catch (e) {
+    box.checked = !box.checked;
+    box.disabled = false;
+    alert(e.message);
+  }
+}
+
+// Fill `format: markdown` placeholders from one batched render request.
+async function fillMarkdown() {
+  if (!mdQueue.length) return;
+  const texts = mdQueue.slice();
+  try {
+    const res = await api('/api/render/markdown', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ texts }),
+    });
+    document.querySelectorAll('[data-md]').forEach(el => {
+      const html = res.html[+el.dataset.md];
+      if (html != null) { el.innerHTML = html; el.removeAttribute('data-md'); }
+    });
+  } catch { /* placeholders already show the raw text */ }
+}
+
+/* ---- resource + outputs nodes (record page only: need rels/outs) ---- */
+
+// The related records for a resource node, from the relationships payload.
+function resourceRecords(node, ctx) {
+  const inbound = ctx.rels?.inbound || [];
+  let records = inbound
+    .filter(link => link.record.model === node.model && (!node.via || link.field === node.via))
+    .map(link => link.record);
+  for (const order of [...(node.order || [])].reverse()) {
+    const dir = order.direction === 'desc' ? -1 : 1;
+    records = records.slice().sort((a, b) => {
+      const [x, y] = [a.values[order.field], b.values[order.field]];
+      if (x == null && y == null) return 0;
+      if (x == null) return 1;
+      if (y == null) return -1;
+      return (x < y ? -1 : x > y ? 1 : 0) * dir;
+    });
+  }
+  return records;
+}
+
+// The reference field on the related model pointing at ctx.model, honoring
+// `via`; used to prefill create forms.
+function resourceRefField(node, ctx) {
+  const related = state.project.models[node.model];
+  if (!related) return null;
+  if (node.via) return related.fields[node.via] ? node.via : null;
+  for (const [name, def] of Object.entries(related.fields)) {
+    if (def.type === 'reference' && def.reference?.model === ctx.model.name) return name;
+  }
+  return null;
+}
+
+function resourceActions(node, ctx) {
+  return (node.actions || []).map(action => {
+    if (action.type === 'navigate') {
+      return `<a class="d-action" href="#/views/${encodeURIComponent(action.view)}">${esc(action.label || 'View all')}</a>`;
+    }
+    if (action.type === 'create') {
+      const refField = resourceRefField(node, ctx);
+      const refDef = refField && state.project.models[node.model].fields[refField];
+      const refValue = refDef ? (ctx.record.values[refDef.reference.field] ?? ctx.record.key) : null;
+      const query = refField && refValue != null
+        ? `?${encodeURIComponent(refField)}=${encodeURIComponent(refValue)}` : '';
+      return `<a class="d-action" href="#/records/${encodeURIComponent(node.model)}/new${query}">${esc(action.label || 'New')}</a>`;
+    }
+    return '';
+  }).join('');
+}
+
+// Model labels are conventionally already plural ("Todos", "Book changes"),
+// so counting means singularizing for 1 rather than pluralizing for many.
+function countNoun(n, label) {
+  const noun = label.toLowerCase();
+  if (n === 1) {
+    if (/ies$/.test(noun)) return noun.slice(0, -3) + 'y';
+    if (/[^s]s$/.test(noun)) return noun.slice(0, -1);
+    return noun;
+  }
+  return /s$/.test(noun) ? noun : pluralize(noun);
+}
+
+function resourceNode(node, ctx, vars) {
+  if (!ctx.rels) return ''; // collection items carry no relationship data
+  const related = state.project.models[node.model];
+  if (!related) return '';
+  const all = resourceRecords(node, ctx);
+  const records = node.limit ? all.slice(0, node.limit) : all;
+  const more = all.length - records.length;
+
+  let body;
+  const display = node.display || 'item';
+  if (display === 'summary') {
+    body = all.length
+      ? `<div class="d-summary">${all.length} ${esc(countNoun(all.length, related.label || related.name))}</div>`
+      : `<div class="d-summary dash">${esc(node.empty ?? 'None yet.')}</div>`;
+  } else if (!all.length) {
+    body = `<div class="d-summary dash">${esc(node.empty ?? 'None yet.')}</div>`;
+  } else if (display === 'checklist') {
+    body = records.map(r => {
+      const done = !!r.values[node.check];
+      const index = checkPayloads.push({ record: r, field: node.check }) - 1;
+      return `<label class="check-row${done ? ' done' : ''}">` +
+        `<input type="checkbox" class="check-toggle" data-check="${index}"${done ? ' checked' : ''}>` +
+        `<a href="${recordHref(r)}">${esc(recordTitle(r, related))}</a></label>`;
+    }).join('');
+  } else if (display === 'table') {
+    const columns = node.fields && node.fields.length
+      ? node.fields.map(c => typeof c === 'string' ? { field: c } : c)
+      : Object.keys(related.fields).slice(0, 3).map(field => ({ field }));
+    const head = columns.map(c =>
+      `<th>${esc(c.label || related.fields[c.field]?.label || c.field)}</th>`).join('');
+    const rows = records.map(r => {
+      const cells = columns.map((c, i) => {
+        const raw = c.field.startsWith('meta.') ? metaValue(r, c.field) : r.values[c.field];
+        const formatted = c.format
+          ? formatFieldValue(raw, related.fields[c.field], c, { model: related, record: r })
+          : formatValue(raw, related.fields[c.field]);
+        const inner = raw == null || raw === '' ? '<span class="dash">—</span>' : formatted;
+        return i === 0 ? `<td><a class="cell" href="${recordHref(r)}">${inner}</a></td>` : `<td class="plain">${inner}</td>`;
+      }).join('');
+      return `<tr>${cells}</tr>`;
+    }).join('');
+    body = `<div class="table-shell mini"><table><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table></div>`;
+  } else { // item
+    const block = related.display?.[node.item || 'card'];
+    const items = records.map(r => recordItem(r, related, block, ctx.depth + 1)).join('');
+    const gridVars = [];
+    responsiveVars('cols', node.columns ?? 1, gridVars);
+    body = `<div class="dgrid" style="${gridVars.join(';')}">${items}</div>`;
+  }
+
+  const moreNote = more > 0 ? `<div class="dres-more">and ${more} more…</div>` : '';
+  const heading = node.title || node.actions?.length
+    ? `<div class="dres-head"><h3 class="d-heading">${esc(node.title || '')}</h3><span class="dres-actions">${resourceActions(node, ctx)}</span></div>`
+    : '';
+  const boxed = display === 'item' ? `${body}${moreNote}` : `<div class="panel">${body}${moreNote}</div>`;
+  return `<div class="dres"${styleAttr(vars)}>${heading}${boxed}</div>`;
+}
+
+function outputsNode(node, ctx, vars) {
+  if (!ctx.outs) return '';
+  const outputs = ctx.outs.outputs || [];
+  const heading = node.title ? `<div class="dres-head"><h3 class="d-heading">${esc(node.title)}</h3></div>` : '';
+  let body;
+  if (!outputs.length) {
+    body = '<div class="d-summary dash">No outputs generated yet.</div>';
+  } else if (node.display === 'list') {
+    body = outputs.map(o => {
+      const status = o.exists ? '<span class="ok">✓</span>' : '<span class="missing">—</span>';
+      const files = (o.files || []).map(f =>
+        `<div class="output-row output-file"><span class="badge"></span><span class="path">${esc(f)}</span><span class="ok">✓</span></div>`).join('');
+      return `<div class="output-row"><span class="badge">${esc(o.name)}</span><span class="path">${esc(o.path)}</span>${status}</div>${files}`;
+    }).join('');
+  } else {
+    const rows = outputs.map(o => {
+      const status = o.exists
+        ? `<span class="ok">${o.is_file ? 'file' : `directory · ${(o.files || []).length} file${(o.files || []).length === 1 ? '' : 's'}`}</span>`
+        : '<span class="missing">not generated</span>';
+      const files = (o.files || []).map(f =>
+        `<tr class="output-file"><td class="plain"></td><td class="plain"><span class="path">${esc(f)}</span></td><td class="plain"><span class="ok">file</span></td></tr>`).join('');
+      return `<tr><td class="plain"><span class="badge">${esc(o.name)}</span></td><td class="plain"><span class="path">${esc(o.path)}</span></td><td class="plain">${status}</td></tr>${files}`;
+    }).join('');
+    body = `<div class="table-shell mini"><table><thead><tr><th>Output</th><th>Path</th><th>Status</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+  }
+  return `<div class="dres"${styleAttr(vars)}>${heading}<div class="panel">${body}</div></div>`;
+}
+
+/* ---- record items: a record rendered through a display block ---- */
+
+// The block a view uses for each record in card-ish contexts.
+function itemBlock(view, model) {
+  const name = view?.display?.item;
+  if (name && model.display?.[name]) return model.display[name];
+  return model.display?.card || null;
+}
+
+// Render one record through a block (else the built-in card), linked.
+function recordItem(record, model, block, depth = 0) {
+  if (!block || depth > MAX_NODE_DEPTH) return recordCard(record, model, []);
+  const ctx = { model, record, rels: null, outs: null, outboundByField: new Map(), depth };
+  const inner = blockNodes(block).map(node => renderNode(node, ctx)).join('');
+  return `<a class="item-link" href="${recordHref(record)}">${inner}</a>`;
+}
+
 function paginationHtml(view, result, q) {
   if (result.pages <= 1) return '';
   const base = p => `#/views/${encodeURIComponent(view.name)}?page=${p}${q ? '&q=' + encodeURIComponent(q) : ''}`;
@@ -432,8 +881,10 @@ async function fetchAndRender(view, model, page, q, token) {
         : `<div class="empty">No records yet.<br><a class="btn primary" href="#/records/${encodeURIComponent(view.model)}/new">New ${esc((model.label || model.name).toLowerCase())}</a></div>`;
       return;
     }
+    resetPageDynamics();
     body.innerHTML = renderView(view, model, result) + paginationHtml(view, result, q);
     wireDynamic(view, model, result);
+    fillMarkdown();
   } catch (e) {
     if (t !== reqToken) return;
     body.innerHTML = `<div class="error">${esc(e.message)}</div>`;
@@ -445,11 +896,10 @@ function renderView(view, model, result) {
   const records = result.records;
   switch (view.type) {
     case 'board': return renderBoard(view, model, records);
-    case 'gallery': return renderGallery(view, model, records);
+    case 'cards': return renderCards(view, model, records);
     case 'calendar': return `<div id="calMount"></div>`; // wired in wireDynamic
     case 'timeline': return renderTimeline(view, model, records);
     case 'tree': return renderTree(view, model, records);
-    case 'custom': return renderCustom(view, model, records);
     case 'table':
     default: return renderTable(view, model, records);
   }
@@ -505,16 +955,19 @@ function renderBoard(view, model, records) {
     const items = buckets.get(v) || [];
     if (!items.length && v === NONE) return '';
     const title = v === NONE ? `No ${esc(label.toLowerCase())}` : esc(v);
+    const block = itemBlock(view, model);
     const cards = items.length
-      ? items.map(r => recordCard(r, model, viewFields(view, model))).join('')
+      ? items.map(r => block ? recordItem(r, model, block) : recordCard(r, model, viewFields(view, model))).join('')
       : '<div class="board-empty">Empty</div>';
     return `<div class="board-col"><div class="board-col-head"><span>${title}</span><span class="n">${items.length}</span></div>${cards}</div>`;
   }).join('');
   return `<div class="board">${cols}</div>`;
 }
 
-/* ---- gallery ---- */
-function renderGallery(view, model, records) {
+/* ---- cards ---- */
+function renderCards(view, model, records) {
+  const block = itemBlock(view, model);
+  if (block) return `<div class="gallery">${records.map(r => recordItem(r, model, block)).join('')}</div>`;
   const fields = viewFields(view, model);
   return `<div class="gallery">${records.map(r => recordCard(r, model, fields)).join('')}</div>`;
 }
@@ -561,8 +1014,9 @@ function renderCalendar(mount, view, model, records) {
         `<a class="cal-ev" href="${recordHref(r)}" title="${esc(recordTitle(r, model))}">${esc(recordTitle(r, model))}</a>`).join('');
       cells += `<div class="cal-cell${key === todayKey ? ' today' : ''}"><div class="cal-date">${day}</div>${evs}</div>`;
     }
+    const block = itemBlock(view, model);
     const undatedHtml = undated.length
-      ? `<div class="undated"><h3>Undated</h3><div class="gallery">${undated.map(r => recordCard(r, model, viewFields(view, model))).join('')}</div></div>`
+      ? `<div class="undated"><h3>Undated</h3><div class="gallery">${undated.map(r => block ? recordItem(r, model, block) : recordCard(r, model, viewFields(view, model))).join('')}</div></div>`
       : '';
     mount.innerHTML =
       `<div class="cal-head"><h2>${esc(monthName)}</h2><div class="cal-nav"><button id="calPrev" aria-label="Previous month">‹</button><button id="calNext" aria-label="Next month">›</button></div></div>` +
@@ -620,21 +1074,17 @@ function renderTree(view, model, records) {
     else (children.get(p) || children.set(p, []).get(p)).push(r);
   }
   const fields = viewFields(view, model);
+  const block = itemBlock(view, model);
   const visited = new Set();
   const node = r => {
     if (visited.has(r.key)) return ''; // cycle guard
     visited.add(r.key);
     const kids = children.get(idOf(r)) || [];
     const kidsHtml = kids.length ? `<div class="tree-children">${kids.map(node).join('')}</div>` : '';
-    return `<div class="tree-node">${recordCard(r, model, fields)}${kidsHtml}</div>`;
+    const card = block ? recordItem(r, model, block) : recordCard(r, model, fields);
+    return `<div class="tree-node">${card}${kidsHtml}</div>`;
   };
   return `<div class="tree">${roots.map(node).join('')}</div>`;
-}
-
-/* ---- custom ---- */
-function renderCustom(view, model, records) {
-  const fields = viewFields(view, model);
-  return `<div class="custom-note">Custom view</div><div class="gallery">${records.map(r => recordCard(r, model, fields)).join('')}</div>`;
 }
 
 /* =========================================================================
@@ -669,6 +1119,7 @@ async function showRecord(modelName, key, prefetched) {
 }
 
 function renderRecord(model, record, rels, outs) {
+  resetPageDynamics();
   const title = recordTitle(record, model);
   const actions =
     `<a class="btn" href="${recordHref(record)}/edit">Edit</a>` +
@@ -683,17 +1134,16 @@ function renderRecord(model, record, rels, outs) {
     (outboundByField.get(link.field) || outboundByField.set(link.field, []).get(link.field)).push(link.record);
   }
 
-  const rows = Object.entries(model.fields).map(([name, def]) => {
-    const value = record.values[name];
-    return `<div><dt>${esc(def.label || name)}</dt><dd>${detailValue(value, def, name, outboundByField)}</dd></div>`;
-  }).join('');
-
-  const html =
-    `<div class="detail"><dl class="fields">${rows}</dl>` +
-    relatedSection(model, rels) +
-    outputsSection(model, outs) +
-    `</div>`;
-  $('#page').innerHTML = html;
+  // A `detail` display block lays out the whole page (including any related
+  // records and outputs the author wants). Without one, the default is a
+  // stacked label-over-value grid plus the automatic related/outputs sections.
+  const detail = model.display?.detail;
+  const ctx = { model, record, rels, outs, outboundByField, depth: 0 };
+  const inner = detail
+    ? blockNodes(detail).map(node => renderNode(node, ctx)).join('')
+    : defaultDetail(model, record, ctx) + relatedSection(model, rels) + outputsSection(model, outs);
+  $('#page').innerHTML = `<div class="detail">${inner}</div>`;
+  fillMarkdown();
 
   $('#deleteBtn').onclick = async () => {
     if (!confirm(`Delete “${title}”? This removes it from disk.`)) return;
@@ -702,6 +1152,20 @@ function renderRecord(model, record, rels, outs) {
       location.hash = backToViewHref();
     } catch (e) { alert(e.message); }
   };
+}
+
+// Default record page: every field as a label-over-value cell in a
+// two-column grid; long-form values span the full width.
+function defaultDetail(model, record, ctx) {
+  const cells = Object.entries(model.fields).map(([name, def]) => {
+    const value = record.values[name];
+    const wide = def.type === 'text' || def.type === 'json' || def.type === 'asset';
+    const inner = value == null || value === ''
+      ? '<span class="dash">—</span>'
+      : detailValue(value, def, name, ctx.outboundByField);
+    return `<div class="kv${wide ? ' kv-wide' : ''}"><div class="k">${esc(def.label || name)}</div><div class="v">${inner}</div></div>`;
+  }).join('');
+  return `<div class="dgrid detail-default" style="--cols-base:1;--cols-md:2;--cgap:32px;--rgap:22px">${cells}</div>`;
 }
 
 // Detail-page value formatting: richer than a table cell.
@@ -747,7 +1211,9 @@ function relatedSection(model, rels) {
   }).join('');
   const panels = list.map((g, i) => {
     const srcModel = state.project.models[g.srcModel];
-    const cards = g.records.map(r => recordCard(r, srcModel, [])).join('');
+    const block = srcModel?.display?.card || null;
+    const cards = g.records.map(r =>
+      block ? recordItem(r, srcModel, block) : recordCard(r, srcModel, [])).join('');
     return `<div class="tabpanel" data-panel="${i}"${i === 0 ? '' : ' hidden'}>${cards}</div>`;
   }).join('');
   // Tab switching is wired after insertion via event delegation.
@@ -881,25 +1347,32 @@ async function showEdit(modelName, key) {
   }
 }
 
-function showCreate(modelName) {
+function showCreate(modelName, query) {
   ++reqToken;
   const model = state.project.models[modelName];
   if (!model) { fatal(`Unknown model “${esc(modelName)}”.`); return; }
   keepNavForRecord(modelName);
   setHeader(`New ${model.label || model.name}`, model.description || '', '');
-  renderFormPage(model, null, Object.keys(model.fields), rec => location.hash = recordHref(rec));
+  // Query params matching field names prefill the form (used by resource
+  // `create` actions to fill in the back-reference).
+  const prefill = {};
+  for (const [name, value] of (query || new URLSearchParams())) {
+    if (model.fields[name]) prefill[name] = value;
+  }
+  const seed = Object.keys(prefill).length ? { values: prefill } : null;
+  renderFormPage(model, seed, Object.keys(model.fields), rec => location.hash = recordHref(rec));
 }
 
-// Shared form page for create + edit. `onSaved(record)` fires after a
-// successful POST/PUT; `existing` (if present) enables PUT + Delete.
+// Shared form page for create + edit. `record` seeds initial values;
+// `existing` (if present) enables PUT + Delete.
 function renderFormPage(model, record, order, onSaved, existing) {
-  const editing = existing || record;
+  const editing = existing;
   const deleteBtn = editing ? '<button type="button" class="btn danger" id="fDelete">Delete</button>' : '';
   const cancelHref = editing ? recordHref(editing) : backToViewHref();
   $('#page').innerHTML =
     `<form class="record-form" id="recordForm" novalidate>` +
     `<p class="form-error" id="formError"></p>` +
-    buildFormFields(model, editing, order) +
+    buildFormFields(model, editing || record, order) +
     `<div class="form-actions">${deleteBtn ? `<span class="spacer">${deleteBtn}</span>` : '<span class="spacer"></span>'}` +
     `<a class="btn" href="${cancelHref}">Cancel</a>` +
     `<button type="submit" class="btn primary">Save</button></div></form>`;

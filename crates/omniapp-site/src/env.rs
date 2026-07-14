@@ -47,7 +47,9 @@ pub(crate) fn build_environment(site_dir: &Path, strict: bool) -> Environment<'s
 }
 
 /// Render CommonMark source to HTML with tables, strikethrough, and footnotes.
-pub(crate) fn render_markdown(source: &str) -> String {
+/// Public so the admin's markdown fields render exactly like the site's.
+#[must_use]
+pub fn render_markdown(source: &str) -> String {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
     options.insert(Options::ENABLE_STRIKETHROUGH);

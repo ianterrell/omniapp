@@ -6,7 +6,8 @@ use std::sync::{LazyLock, RwLock};
 use chrono::{DateTime, NaiveDate};
 use omniapp_schema::{
     Field, FieldSource, FieldType, Model, Problem, ProjectConfig, Storage, View, is_safe_relative,
-    read_yaml, validate_config, validate_model, validate_navigation, validate_view,
+    read_yaml, validate_config, validate_display_references, validate_model, validate_navigation,
+    validate_view,
 };
 use rayon::prelude::*;
 use regex::Regex;
@@ -214,15 +215,23 @@ impl RecordsSnapshot {
         let records = self.model_records(model_name);
         let record = (*find_in_records(&records, model_name, key)?).clone();
         let mut outputs = Vec::new();
-        for (name, template) in &model.outputs {
-            let path = render_path_template(template, &record.values)?;
+        for (name, spec) in &model.outputs {
+            let path = render_path_template(spec.path(), &record.values)?;
             let absolute = self.loaded.root.join(&path);
+            let is_directory = absolute.is_dir();
+            let files = if spec.kind() == omniapp_schema::OutputKind::Directory && is_directory {
+                list_output_files(&absolute)
+            } else {
+                Vec::new()
+            };
             outputs.push(GeneratedOutput {
                 name: name.clone(),
                 path,
+                kind: spec.kind(),
                 exists: absolute.exists(),
                 is_file: absolute.is_file(),
-                is_directory: absolute.is_dir(),
+                is_directory,
+                files,
             });
         }
         Ok(OutputSet { record, outputs })
@@ -1294,6 +1303,28 @@ fn find_in_records<'a>(
     }
 }
 
+/// Every file under a directory output, recursive, hidden entries skipped,
+/// as sorted paths relative to the directory itself.
+fn list_output_files(directory: &Path) -> Vec<String> {
+    let hidden = |name: &std::ffi::OsStr| name.to_string_lossy().starts_with('.');
+    let mut files: Vec<String> = WalkDir::new(directory)
+        .min_depth(1)
+        .into_iter()
+        .filter_entry(|entry| !hidden(entry.file_name()))
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .filter_map(|entry| {
+            entry
+                .path()
+                .strip_prefix(directory)
+                .ok()
+                .map(|relative| relative.to_string_lossy().into_owned())
+        })
+        .collect();
+    files.sort();
+    files
+}
+
 /// Render a `{field}`-placeholder path template against record values, e.g. for
 /// model outputs or site permalinks. Rendered values must be scalar and must
 /// not introduce path separators or unsafe segments.
@@ -1846,6 +1877,11 @@ fn validation_report(
     )));
     for model in loaded.models.values() {
         diagnostics.extend(problems_to_diagnostics(validate_model(model)));
+        diagnostics.extend(problems_to_diagnostics(validate_display_references(
+            model,
+            &loaded.models,
+            &loaded.views,
+        )));
     }
     for view in loaded.views.values() {
         diagnostics.extend(problems_to_diagnostics(validate_view(view, &loaded.models)));
@@ -1967,6 +2003,7 @@ mod tests {
             },
             fields: BTreeMap::new(),
             outputs: BTreeMap::new(),
+            display: BTreeMap::new(),
         };
         let note = Model {
             version: 1,
@@ -1978,6 +2015,7 @@ mod tests {
             },
             fields: BTreeMap::new(),
             outputs: BTreeMap::new(),
+            display: BTreeMap::new(),
         };
         let models = BTreeMap::from([("Book".to_owned(), book), ("Note".to_owned(), note)]);
         let unified = discover_all_record_locations(root, &models);
@@ -2025,6 +2063,7 @@ mod tests {
                 ),
             ]),
             outputs: BTreeMap::new(),
+            display: BTreeMap::new(),
         };
         write_test_project(root, &model);
         fs::create_dir_all(root.join("notes")).unwrap();
@@ -2098,6 +2137,7 @@ mod tests {
                 ),
             )]),
             outputs: BTreeMap::new(),
+            display: BTreeMap::new(),
         };
         let location = directory.path().join("books/dune.md");
         fs::create_dir_all(location.parent().unwrap()).unwrap();
@@ -2171,10 +2211,17 @@ mod tests {
                     ),
                 ),
             ]),
-            outputs: BTreeMap::from([(
-                "publication".into(),
-                "build/{slug}/book-{slug}.pdf".into(),
-            )]),
+            outputs: BTreeMap::from([
+                ("publication".into(), "build/{slug}/book-{slug}.pdf".into()),
+                (
+                    "artifacts".into(),
+                    omniapp_schema::OutputSpec::Detailed(omniapp_schema::OutputDetail {
+                        path: "build/{slug}".into(),
+                        kind: omniapp_schema::OutputKind::Directory,
+                    }),
+                ),
+            ]),
+            display: BTreeMap::new(),
         };
         fs::write(
             directory.path().join(".omniapp/models/book.yml"),
@@ -2215,14 +2262,34 @@ mod tests {
             record.revision
         );
         let outputs = workspace.outputs("Book", &record.key).unwrap();
+        let publication = |set: &OutputSet| {
+            set.outputs
+                .iter()
+                .find(|output| output.name == "publication")
+                .cloned()
+                .unwrap()
+        };
         assert_eq!(
-            outputs.outputs[0].path,
+            publication(&outputs).path,
             Path::new("build/dune/book-dune.pdf")
         );
-        assert!(!outputs.outputs[0].exists);
-        fs::create_dir_all(directory.path().join("build/dune")).unwrap();
+        assert!(!publication(&outputs).exists);
+        fs::create_dir_all(directory.path().join("build/dune/extra")).unwrap();
         fs::write(directory.path().join("build/dune/book-dune.pdf"), b"pdf").unwrap();
-        assert!(workspace.outputs("Book", &record.key).unwrap().outputs[0].is_file);
+        fs::write(directory.path().join("build/dune/extra/notes.txt"), b"n").unwrap();
+        fs::write(directory.path().join("build/dune/.hidden"), b"h").unwrap();
+        let outputs = workspace.outputs("Book", &record.key).unwrap();
+        assert!(publication(&outputs).is_file);
+        let artifacts = outputs
+            .outputs
+            .iter()
+            .find(|output| output.name == "artifacts")
+            .unwrap();
+        assert!(artifacts.is_directory);
+        assert_eq!(
+            artifacts.files,
+            vec!["book-dune.pdf".to_owned(), "extra/notes.txt".to_owned()]
+        );
         assert_eq!(
             fs::read_to_string(directory.path().join("books/dune/README.md")).unwrap(),
             "# Dune\n"
@@ -2308,6 +2375,7 @@ mod tests {
                 ),
             ]),
             outputs: BTreeMap::new(),
+            display: BTreeMap::new(),
         };
         write_test_project(directory.path(), &model);
 
@@ -2387,6 +2455,7 @@ mod tests {
                 ),
             ]),
             outputs: BTreeMap::new(),
+            display: BTreeMap::new(),
         };
         write_test_project(directory.path(), &model);
         let created = workspace
@@ -2494,6 +2563,7 @@ mod tests {
                 ),
             ]),
             outputs: BTreeMap::new(),
+            display: BTreeMap::new(),
         };
         let mut book_reference = field(
             FieldType::Reference,
@@ -2540,6 +2610,7 @@ mod tests {
                 ),
             ]),
             outputs: BTreeMap::new(),
+            display: BTreeMap::new(),
         };
         write_test_project(directory.path(), &book);
         fs::write(
