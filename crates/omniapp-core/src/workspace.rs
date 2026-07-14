@@ -2003,6 +2003,7 @@ mod tests {
             },
             fields: BTreeMap::new(),
             parent: None,
+            title: None,
             outputs: BTreeMap::new(),
             display: BTreeMap::new(),
         };
@@ -2016,6 +2017,7 @@ mod tests {
             },
             fields: BTreeMap::new(),
             parent: None,
+            title: None,
             outputs: BTreeMap::new(),
             display: BTreeMap::new(),
         };
@@ -2065,6 +2067,7 @@ mod tests {
                 ),
             ]),
             parent: None,
+            title: None,
             outputs: BTreeMap::new(),
             display: BTreeMap::new(),
         };
@@ -2140,6 +2143,7 @@ mod tests {
                 ),
             )]),
             parent: None,
+            title: None,
             outputs: BTreeMap::new(),
             display: BTreeMap::new(),
         };
@@ -2216,6 +2220,7 @@ mod tests {
                 ),
             ]),
             parent: None,
+            title: None,
             outputs: BTreeMap::from([
                 ("publication".into(), "build/{slug}/book-{slug}.pdf".into()),
                 (
@@ -2380,6 +2385,7 @@ mod tests {
                 ),
             ]),
             parent: None,
+            title: None,
             outputs: BTreeMap::new(),
             display: BTreeMap::new(),
         };
@@ -2461,6 +2467,7 @@ mod tests {
                 ),
             ]),
             parent: None,
+            title: None,
             outputs: BTreeMap::new(),
             display: BTreeMap::new(),
         };
@@ -2570,6 +2577,7 @@ mod tests {
                 ),
             ]),
             parent: None,
+            title: None,
             outputs: BTreeMap::new(),
             display: BTreeMap::new(),
         };
@@ -2618,6 +2626,7 @@ mod tests {
                 ),
             ]),
             parent: None,
+            title: None,
             outputs: BTreeMap::new(),
             display: BTreeMap::new(),
         };

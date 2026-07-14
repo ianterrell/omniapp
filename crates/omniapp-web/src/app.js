@@ -297,9 +297,11 @@ function pluralize(word) {
 
 function modelLabel(name) { const m = state.project.models[name]; return m?.label || name; }
 
-// Title heuristic shared by cards and detail header.
+// Record title shared by breadcrumbs, cards, and the detail header: the
+// model's configured title field when set, else the heuristic.
 function recordTitle(record, model) {
   const v = record.values || {};
+  if (model.title && v[model.title] != null && v[model.title] !== '') return String(v[model.title]);
   if (v.title != null && v.title !== '') return String(v.title);
   if (v.name != null && v.name !== '') return String(v.name);
   for (const [f, def] of Object.entries(model.fields)) {
@@ -1178,12 +1180,13 @@ function renderRecord(model, record, rels, outs, crumbs = []) {
     `<a class="btn" href="${recordHref(record)}/edit">Edit</a>` +
     `<button class="btn danger" id="deleteBtn">Delete</button>`;
   setHeader(title, '', actions);
-  const trail = crumbs.length
+  // With a trail, the final segment is the record itself (its own title, not
+  // the collection's label); without one, the model badge says what this is.
+  $('#subtitle').innerHTML = crumbs.length
     ? `<span class="crumbs">${crumbs.map(c =>
         `<a href="${recordHref(c.record)}">${esc(recordTitle(c.record, c.model))}</a>`
-      ).join('<span class="crumb-sep">›</span>')}<span class="crumb-sep">›</span></span>`
-    : '';
-  $('#subtitle').innerHTML = `${trail}<span class="badge plain">${esc(model.label || model.name)}</span>`;
+      ).join('<span class="crumb-sep">›</span>')}<span class="crumb-sep">›</span><span class="crumb-current">${esc(title)}</span></span>`
+    : `<span class="badge plain">${esc(model.label || model.name)}</span>`;
 
   // Outbound reference links, resolved to canonical records where the
   // relationships endpoint gives us a match on field name.

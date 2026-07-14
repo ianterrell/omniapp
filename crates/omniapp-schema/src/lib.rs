@@ -105,6 +105,12 @@ pub struct Model {
     /// rather than top-level navigation.
     #[serde(default)]
     pub parent: Option<String>,
+    /// The field whose value titles a record wherever one is shown
+    /// (breadcrumbs, page headers, cards, checklist rows). Without it,
+    /// consumers fall back to a heuristic: title, then name, then the first
+    /// required string field with a value, then the record key.
+    #[serde(default)]
+    pub title: Option<String>,
     pub fields: BTreeMap<String, Field>,
     #[serde(default)]
     pub outputs: BTreeMap<String, OutputSpec>,
@@ -553,6 +559,14 @@ pub fn validate_model(model: &Model) -> Vec<Problem> {
                 format!("parent {parent:?} must name a reference field"),
             ));
         }
+    }
+    if let Some(title) = &model.title
+        && !model.fields.contains_key(title)
+    {
+        problems.push(Problem::new(
+            format!("{location}.title"),
+            format!("title {title:?} must name a field"),
+        ));
     }
     let placeholders = path_placeholders(storage_path);
     for placeholder in &placeholders {
