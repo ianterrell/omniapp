@@ -240,7 +240,10 @@ function router() {
 
   if (seg[0] === 'views') {
     const name = dec(seg[1] || '');
-    renderViewPage(name, { page: parseInt(query.get('page'), 10) || 1, q: query.get('q') || '' });
+    // `f.<field>=<value>` params are runtime equality filters on the view.
+    const filters = {};
+    for (const [k, v] of query.entries()) if (k.startsWith('f.')) filters[k.slice(2)] = v;
+    renderViewPage(name, { page: parseInt(query.get('page'), 10) || 1, q: query.get('q') || '', filters });
     return;
   }
   if (seg[0] === 'records') {
@@ -691,7 +694,15 @@ function resourceRefField(node, ctx) {
 function resourceActions(node, ctx) {
   return (node.actions || []).map(action => {
     if (action.type === 'navigate') {
-      return `<a class="d-action" href="#/views/${encodeURIComponent(action.view)}">${esc(action.label || 'View all')}</a>`;
+      let suffix = '';
+      if (action.filtered) {
+        // Pin the view to this record via the related model's back-reference.
+        const refField = resourceRefField(node, ctx);
+        const refDef = refField && state.project.models[node.model].fields[refField];
+        const refValue = refDef ? (ctx.record.values[refDef.reference.field] ?? ctx.record.key) : null;
+        if (refField && refValue != null) suffix = `?f.${encodeURIComponent(refField)}=${encodeURIComponent(refValue)}`;
+      }
+      return `<a class="d-action" href="#/views/${encodeURIComponent(action.view)}${suffix}">${esc(action.label || 'View all')}</a>`;
     }
     if (action.type === 'create') {
       const refField = resourceRefField(node, ctx);
@@ -834,9 +845,9 @@ function recordItem(record, model, block, depth = 0) {
   return `<a class="item-link" href="${recordHref(record)}">${inner}</a>`;
 }
 
-function paginationHtml(view, result, q) {
+function paginationHtml(view, result, q, filters) {
   if (result.pages <= 1) return '';
-  const base = p => `#/views/${encodeURIComponent(view.name)}?page=${p}${q ? '&q=' + encodeURIComponent(q) : ''}`;
+  const base = p => `#/views/${encodeURIComponent(view.name)}?page=${p}${q ? '&q=' + encodeURIComponent(q) : ''}${filterParams(filters)}`;
   const prev = result.page > 1
     ? `<a class="btn" href="${base(result.page - 1)}">Previous</a>`
     : `<span class="btn" aria-disabled="true" style="opacity:.45">Previous</span>`;
@@ -871,9 +882,16 @@ async function renderViewPage(name, opts) {
   const newBtn = `<a class="btn primary" href="#/records/${encodeURIComponent(view.model)}/new">New ${esc((model.label || model.name).toLowerCase())}</a>`;
   setHeader(view.label || view.name, model.description || `${model.label || model.name} · ${view.type} view`, newBtn);
 
+  const filters = opts.filters || {};
+  const chips = Object.entries(filters).map(([field, value]) => {
+    const rest = filterParams(Object.fromEntries(Object.entries(filters).filter(([f]) => f !== field)));
+    const clearHref = `#/views/${encodeURIComponent(view.name)}?page=1${opts.q ? '&q=' + encodeURIComponent(opts.q) : ''}${rest}`;
+    const label = model.fields[field]?.label || field;
+    return `<span class="filter-chip">${esc(label)}: ${esc(String(value))}<a href="${clearHref}" title="Clear filter">×</a></span>`;
+  }).join('');
   const placeholder = `Search ${esc((model.label || model.name).toLowerCase())}…`;
   $('#page').innerHTML =
-    `<div class="toolbar"><input class="search" id="search" type="search" placeholder="${placeholder}" value="${esc(opts.q)}"><span class="count" id="count"></span></div>` +
+    `<div class="toolbar"><input class="search" id="search" type="search" placeholder="${placeholder}" value="${esc(opts.q)}">${chips}<span class="count" id="count"></span></div>` +
     `<div id="viewBody"><div class="loading">Loading records…</div></div>`;
 
   // Debounced server-side search: update the hash (replaceState → no history
@@ -884,16 +902,22 @@ async function renderViewPage(name, opts) {
     clearTimeout(debounce);
     debounce = setTimeout(() => {
       const q = input.value.trim();
-      const href = `#/views/${encodeURIComponent(view.name)}?page=1${q ? '&q=' + encodeURIComponent(q) : ''}`;
+      const href = `#/views/${encodeURIComponent(view.name)}?page=1${q ? '&q=' + encodeURIComponent(q) : ''}${filterParams(filters)}`;
       history.replaceState(null, '', href);
-      fetchAndRender(view, model, 1, q);
+      fetchAndRender(view, model, 1, q, filters);
     }, 250);
   };
 
-  await fetchAndRender(view, model, opts.page, opts.q, t);
+  await fetchAndRender(view, model, opts.page, opts.q, filters, t);
 }
 
-async function fetchAndRender(view, model, page, q, token) {
+// `f.<field>=<value>` hash-param string for a filter set (leading &).
+function filterParams(filters) {
+  return Object.entries(filters || {}).map(([field, value]) =>
+    `&f.${encodeURIComponent(field)}=${encodeURIComponent(value)}`).join('');
+}
+
+async function fetchAndRender(view, model, page, q, filters, token) {
   const t = token ?? ++reqToken;
   const body = $('#viewBody');
   if (!body) return;
@@ -901,19 +925,23 @@ async function fetchAndRender(view, model, page, q, token) {
   const route = isReal
     ? `/api/views/${encodeURIComponent(view.name)}/records`
     : `/api/models/${encodeURIComponent(view.model)}/records`;
+  const entries = Object.entries(filters || {});
+  const filterParam = entries.length
+    ? '&filter=' + encodeURIComponent(JSON.stringify(entries.map(([field, value]) => ({ field, op: 'eq', value }))))
+    : '';
   try {
-    const result = await api(`${route}?page=${page}&q=${encodeURIComponent(q || '')}`);
+    const result = await api(`${route}?page=${page}&q=${encodeURIComponent(q || '')}${filterParam}`);
     if (t !== reqToken) return;
     const count = $('#count');
     if (count) count.textContent = `${result.total} record${result.total === 1 ? '' : 's'}`;
     if (!result.records.length) {
-      body.innerHTML = q
-        ? `<div class="empty">No records match “${esc(q)}”.</div>`
+      body.innerHTML = q || entries.length
+        ? `<div class="empty">No records match.</div>`
         : `<div class="empty">No records yet.<br><a class="btn primary" href="#/records/${encodeURIComponent(view.model)}/new">New ${esc((model.label || model.name).toLowerCase())}</a></div>`;
       return;
     }
     resetPageDynamics();
-    body.innerHTML = renderView(view, model, result) + paginationHtml(view, result, q);
+    body.innerHTML = renderView(view, model, result) + paginationHtml(view, result, q, filters);
     wireDynamic(view, model, result);
     fillMarkdown();
   } catch (e) {

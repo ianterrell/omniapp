@@ -277,6 +277,13 @@ tr.expand-detail > td { padding:4px 14px 14px 40px; background:#fbfcfa }
 .crumb-sep { color:#c2c9c3; font-size:12px }
 .crumb-current { color:var(--ink); font-size:13px }
 
+/* Runtime view filters */
+.filter-chip { display:inline-flex; align-items:center; gap:6px; padding:4px 10px;
+  border:1px solid var(--line); border-radius:999px; background:var(--accent-soft);
+  color:var(--ink); font-size:12px; white-space:nowrap }
+.filter-chip a { color:var(--muted); text-decoration:none; font-size:14px; line-height:1 }
+.filter-chip a:hover { color:var(--danger) }
+
 /* ---------- Assets ---------- */
 .asset-thumb { display:block; width:64px; height:44px; object-fit:cover; border-radius:6px;
   border:1px solid var(--line); background:#eef1ee }

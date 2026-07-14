@@ -13,7 +13,7 @@ use axum::{Json, Router};
 use omniapp_core::{
     Cache, RecordInput, RecordsSnapshot, Workspace, WorkspaceError, WorkspaceWatcher,
 };
-use omniapp_schema::Query as RecordQuery;
+use omniapp_schema::{Filter, Model, Query as RecordQuery};
 use omniapp_site::{LoadedSite, Resolution, SiteError, render_error_page};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -100,6 +100,11 @@ struct PageParams {
     /// Substring search across the whole result set (all pages).
     #[serde(default)]
     q: Option<String>,
+    /// Extra filters applied on top of the view's query: a JSON filter
+    /// object (`{"field":"book","op":"eq","value":"small"}`) or an array of
+    /// them. Fields must exist on the model.
+    #[serde(default)]
+    filter: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -387,6 +392,31 @@ async fn project(State(state): State<AppState>) -> Result<Json<Value>, ApiError>
     })))
 }
 
+/// The `filter` query param: one JSON filter object or an array of them,
+/// with every field checked against the model.
+fn parse_filters(raw: Option<&str>, model: &Model) -> Result<Vec<Filter>, ApiError> {
+    let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let value: Value = serde_json::from_str(raw)
+        .map_err(|error| ApiError::bad_request(format!("invalid filter: {error}")))?;
+    let filters: Vec<Filter> = if value.is_array() {
+        serde_json::from_value(value)
+    } else {
+        serde_json::from_value(value).map(|filter| vec![filter])
+    }
+    .map_err(|error| ApiError::bad_request(format!("invalid filter: {error}")))?;
+    for filter in &filters {
+        if !model.fields.contains_key(&filter.field) {
+            return Err(ApiError::bad_request(format!(
+                "unknown filter field {:?} on model {}",
+                filter.field, model.name
+            )));
+        }
+    }
+    Ok(filters)
+}
+
 async fn model_records(
     State(state): State<AppState>,
     Path(model_name): Path<String>,
@@ -399,6 +429,7 @@ async fn model_records(
         .ok_or_else(|| WorkspaceError::UnknownModel(model_name.clone()))?;
     let query = RecordQuery {
         page_size: params.page_size.unwrap_or(50),
+        filters: parse_filters(params.filter.as_deref(), model)?,
         ..RecordQuery::default()
     };
     let cache = Cache::open(&state.workspace.metadata_dir().join("cache.sqlite3"))?;
@@ -428,6 +459,9 @@ async fn view_records(
     if let Some(page_size) = params.page_size {
         query.page_size = page_size;
     }
+    query
+        .filters
+        .extend(parse_filters(params.filter.as_deref(), model)?);
     let cache = Cache::open(&state.workspace.metadata_dir().join("cache.sqlite3"))?;
     Ok(Json(serde_json::to_value(cache.query(
         &model.name,
@@ -569,6 +603,13 @@ impl ApiError {
     fn not_found(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
+            message: message.into(),
+        }
+    }
+
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
             message: message.into(),
         }
     }

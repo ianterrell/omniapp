@@ -344,11 +344,14 @@ pub enum ResourceAction {
         #[serde(default)]
         label: Option<String>,
     },
-    /// Link to a view.
+    /// Link to a view. With `filtered`, the link pins the view to this
+    /// record: an equality filter on the related model's back-reference.
     Navigate {
         #[serde(default)]
         label: Option<String>,
         view: String,
+        #[serde(default)]
+        filtered: bool,
     },
 }
 
@@ -668,10 +671,22 @@ fn check_node_references(
             }
         }
         for action in actions {
-            if let ResourceAction::Navigate { view, .. } = action
-                && !views.contains_key(view)
-            {
-                problems.push(Problem::new(path, format!("unknown view {view:?}")));
+            if let ResourceAction::Navigate { view, filtered, .. } = action {
+                match views.get(view) {
+                    None => {
+                        problems.push(Problem::new(path, format!("unknown view {view:?}")));
+                    }
+                    Some(target) if *filtered && target.model != *related_name => {
+                        problems.push(Problem::new(
+                            path,
+                            format!(
+                                "filtered navigate must target a view of {related_name}, but {view:?} shows {}",
+                                target.model
+                            ),
+                        ));
+                    }
+                    _ => {}
+                }
             }
         }
         // Expand nodes render in the related record's context, so both their
