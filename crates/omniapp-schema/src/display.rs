@@ -117,6 +117,11 @@ pub enum DisplayNode {
         /// For `display: table` — the columns.
         #[serde(default)]
         fields: Vec<TableField>,
+        /// For `display: table` — display nodes rendered in the related
+        /// record's own context inside a per-row expand/contract disclosure
+        /// (e.g. a document's Markdown body).
+        #[serde(default)]
+        expand: Vec<DisplayNode>,
         /// For `display: checklist` — the boolean field toggled in place.
         #[serde(default)]
         check: Option<String>,
@@ -486,6 +491,7 @@ fn validate_node(
             display,
             item,
             check,
+            expand,
             ..
         } => {
             // Cross-model details are checked in validate_display_references;
@@ -501,6 +507,9 @@ fn validate_node(
             }
             if !matches!(display, ResourceDisplay::Item) && item.is_some() {
                 problems.push(Problem::new(path, "item is only valid for display: item"));
+            }
+            if !matches!(display, ResourceDisplay::Table) && !expand.is_empty() {
+                problems.push(Problem::new(path, "expand is only valid for display: table"));
             }
         }
         DisplayNode::Outputs { .. } if model.outputs.is_empty() => {
@@ -569,6 +578,7 @@ fn check_node_references(
         check,
         order,
         actions,
+        expand,
         ..
     } = node
     {
@@ -663,6 +673,13 @@ fn check_node_references(
             {
                 problems.push(Problem::new(path, format!("unknown view {view:?}")));
             }
+        }
+        // Expand nodes render in the related record's context, so both their
+        // shape and their references validate against the related model.
+        for (index, expand_node) in expand.iter().enumerate() {
+            let expand_path = format!("{path}.expand[{index}]");
+            validate_node(related, expand_node, None, &expand_path, problems);
+            check_node_references(related, expand_node, models, views, &expand_path, problems);
         }
     }
     for (index, child) in node.children().iter().enumerate() {
@@ -884,6 +901,50 @@ fields:
                 "expected {expected:?} for {display}, got {problems:?}"
             );
         }
+    }
+
+    #[test]
+    fn expand_validates_against_the_related_model() {
+        let views = BTreeMap::new();
+
+        // Expand nodes are the related model's namespace: title is a Todo
+        // field (fine), state is a Book field (unknown over there).
+        let ok = book_with_display(
+            "  detail:\n    - { type: resource, model: Todo, display: table, fields: [title], expand: [{ type: field, name: title }] }",
+        );
+        let models = BTreeMap::from([
+            ("Book".to_owned(), ok.clone()),
+            ("Todo".to_owned(), model(TODO)),
+        ]);
+        assert_eq!(
+            validate_display_references(&ok, &models, &views),
+            Vec::new()
+        );
+
+        let wrong_model = book_with_display(
+            "  detail:\n    - { type: resource, model: Todo, display: table, fields: [title], expand: [{ type: field, name: state }] }",
+        );
+        let models = BTreeMap::from([
+            ("Book".to_owned(), wrong_model.clone()),
+            ("Todo".to_owned(), model(TODO)),
+        ]);
+        let problems = validate_display_references(&wrong_model, &models, &views);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.message.contains("unknown field") && p.message.contains("Todo")),
+            "expected an unknown-field problem on Todo, got {problems:?}"
+        );
+
+        let not_table = display_problems(
+            "  detail:\n    - { type: resource, model: Todo, display: summary, expand: [{ type: field, name: title }] }",
+        );
+        assert!(
+            not_table
+                .iter()
+                .any(|p| p.message.contains("only valid for display: table")),
+            "expected a display-shape problem, got {not_table:?}"
+        );
     }
 
     #[test]

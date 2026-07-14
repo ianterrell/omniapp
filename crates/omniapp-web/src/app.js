@@ -91,10 +91,21 @@ async function boot() {
   applyTheme(cfg.theme);
   buildNav();
   window.addEventListener('hashchange', router);
-  // Delegated handlers for display-DSL dynamics (copy buttons, checklists).
+  // Delegated handlers for display-DSL dynamics (copy buttons, checklists,
+  // expandable resource rows).
   document.addEventListener('click', e => {
     const button = e.target.closest('.copy-btn');
-    if (button) { e.preventDefault(); handleCopyClick(button); }
+    if (button) { e.preventDefault(); handleCopyClick(button); return; }
+    const toggle = e.target.closest('.expand-toggle');
+    if (toggle) {
+      e.preventDefault();
+      const detail = toggle.closest('tr')?.nextElementSibling;
+      if (!detail?.classList.contains('expand-detail')) return;
+      const open = detail.hidden;
+      detail.hidden = !open;
+      toggle.textContent = open ? '▾' : '▸';
+      toggle.setAttribute('aria-expanded', String(open));
+    }
   });
   document.addEventListener('change', e => {
     const box = e.target.closest('.check-toggle');
@@ -728,7 +739,8 @@ function resourceNode(node, ctx, vars) {
     const columns = node.fields && node.fields.length
       ? node.fields.map(c => typeof c === 'string' ? { field: c } : c)
       : Object.keys(related.fields).slice(0, 3).map(field => ({ field }));
-    const head = columns.map(c =>
+    const expandable = (node.expand || []).length > 0;
+    const head = (expandable ? '<th class="expand-cell"></th>' : '') + columns.map(c =>
       `<th>${esc(c.label || related.fields[c.field]?.label || c.field)}</th>`).join('');
     const rows = records.map(r => {
       const cells = columns.map((c, i) => {
@@ -739,7 +751,14 @@ function resourceNode(node, ctx, vars) {
         const inner = raw == null || raw === '' ? '<span class="dash">—</span>' : formatted;
         return i === 0 ? `<td><a class="cell" href="${recordHref(r)}">${inner}</a></td>` : `<td class="plain">${inner}</td>`;
       }).join('');
-      return `<tr>${cells}</tr>`;
+      if (!expandable) return `<tr>${cells}</tr>`;
+      // Detail rendered up front (hidden) so markdown placeholders hydrate in
+      // the page's one batched render; the toggle only flips visibility.
+      const detailCtx = { model: related, record: r, rels: null, outs: null, outboundByField: new Map(), depth: ctx.depth + 1 };
+      const detail = (node.expand || []).map(n => renderNode(n, detailCtx)).join('');
+      const toggle = `<td class="plain expand-cell"><button class="expand-toggle" type="button" aria-expanded="false">▸</button></td>`;
+      return `<tr>${toggle}${cells}</tr>` +
+        `<tr class="expand-detail" hidden><td class="plain" colspan="${columns.length + 1}">${detail}</td></tr>`;
     }).join('');
     body = `<div class="table-shell mini"><table><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table></div>`;
   } else { // item
