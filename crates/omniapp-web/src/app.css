@@ -277,6 +277,11 @@ tr.expand-detail > td { padding:4px 14px 14px 40px; background:#fbfcfa }
 .crumb-sep { color:#c2c9c3; font-size:12px }
 .crumb-current { color:var(--ink); font-size:13px }
 
+/* Tree rows + within-tab breadcrumbs */
+.tree-indent { display:inline-block; width:20px; height:1px;
+  border-left:1px solid var(--line); margin-right:0; vertical-align:middle; align-self:stretch }
+.tab-crumbs { display:flex; align-items:center; gap:10px; margin:-6px 0 16px; font-size:13px }
+
 /* Record-page tabs */
 .rec-tabs { display:flex; gap:2px; margin:0 0 18px; border-bottom:1px solid var(--line); flex-wrap:wrap }
 .rec-tab { padding:8px 14px; color:var(--muted); text-decoration:none; font-size:13.5px;

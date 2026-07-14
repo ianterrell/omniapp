@@ -117,11 +117,15 @@ pub enum DisplayNode {
         /// For `display: table` — the columns.
         #[serde(default)]
         fields: Vec<TableField>,
-        /// For `display: table` — display nodes rendered in the related
-        /// record's own context inside a per-row expand/contract disclosure
-        /// (e.g. a document's Markdown body).
+        /// For `display: table` or `tree` — display nodes rendered in the
+        /// related record's own context inside a per-row expand/contract
+        /// disclosure (e.g. a document's Markdown body).
         #[serde(default)]
         expand: Vec<DisplayNode>,
+        /// For `display: tree` — the self-reference field on the related
+        /// model that links a record to its parent record.
+        #[serde(default)]
+        tree: Option<String>,
         /// For `display: checklist` — the boolean field toggled in place.
         #[serde(default)]
         check: Option<String>,
@@ -308,6 +312,9 @@ pub enum ResourceDisplay {
     #[default]
     Item,
     Table,
+    /// A table whose rows nest by a self-reference on the related model
+    /// (`tree:` names that field); columns and expand work as for `table`.
+    Tree,
     Checklist,
     Summary,
 }
@@ -495,6 +502,7 @@ fn validate_node(
             item,
             check,
             expand,
+            tree,
             ..
         } => {
             // Cross-model details are checked in validate_display_references;
@@ -511,8 +519,22 @@ fn validate_node(
             if !matches!(display, ResourceDisplay::Item) && item.is_some() {
                 problems.push(Problem::new(path, "item is only valid for display: item"));
             }
-            if !matches!(display, ResourceDisplay::Table) && !expand.is_empty() {
-                problems.push(Problem::new(path, "expand is only valid for display: table"));
+            if !matches!(display, ResourceDisplay::Table | ResourceDisplay::Tree)
+                && !expand.is_empty()
+            {
+                problems.push(Problem::new(
+                    path,
+                    "expand is only valid for display: table or tree",
+                ));
+            }
+            if matches!(display, ResourceDisplay::Tree) && tree.is_none() {
+                problems.push(Problem::new(
+                    path,
+                    "tree display requires tree: <self-reference field>",
+                ));
+            }
+            if !matches!(display, ResourceDisplay::Tree) && tree.is_some() {
+                problems.push(Problem::new(path, "tree is only valid for display: tree"));
             }
         }
         DisplayNode::Outputs { .. } if model.outputs.is_empty() => {
@@ -582,6 +604,7 @@ fn check_node_references(
         order,
         actions,
         expand,
+        tree,
         ..
     } = node
     {
@@ -687,6 +710,20 @@ fn check_node_references(
                     }
                     _ => {}
                 }
+            }
+        }
+        if let Some(tree) = tree {
+            let is_self_reference = related.fields.get(tree).is_some_and(|field| {
+                field
+                    .reference
+                    .as_ref()
+                    .is_some_and(|reference| reference.model == *related_name)
+            });
+            if !is_self_reference {
+                problems.push(Problem::new(
+                    path,
+                    format!("tree field {tree:?} must be a self-reference on {related_name}"),
+                ));
             }
         }
         // Expand nodes render in the related record's context, so both their

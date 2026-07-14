@@ -284,7 +284,8 @@ function router() {
 
 // Walk a nested route: /books/rude/docs/idea[/tab-or-edit]. Segments resolve
 // records pairwise (route + identity); one trailing segment is a tab of the
-// final record, or `edit`.
+// final record, or `edit`. A record below a tabbed ancestor renders inside
+// that ancestor's tab (header + tab bar stay put).
 async function routeNested(segs) {
   const t = ++reqToken;
   setHeader('Loading…', '', '');
@@ -293,6 +294,7 @@ async function routeNested(segs) {
     if (segs.length < 2) { fatal('Missing record identifier.'); return; }
     let modelName = rootRoutes.get(segs[0]);
     let record = await findByIdentity(modelName, null, segs[1]);
+    const chain = [{ modelName, record, route: segs[0] }];
     let i = 2;
     let tab = null;
     while (i < segs.length) {
@@ -300,21 +302,68 @@ async function routeNested(segs) {
       const model = state.project.models[modelName];
       if (i === segs.length - 1) {
         if (s === 'edit') { if (t === reqToken) showEdit(modelName, record.key); return; }
-        const match = (model.tabs || []).find(tb => (tb.route || tb.block) === s);
+        const match = (model.tabs || []).find(tb => tb_route(tb) === s);
         if (match) { tab = tb_route(match); i += 1; continue; }
       }
       const childModel = childRoutes.get(modelName)?.get(s);
       if (!childModel || i + 1 >= segs.length) { fatal(`Unknown route segment “${esc(s)}”.`); return; }
       record = await findByIdentity(childModel, modelName, segs[i + 1], record);
       modelName = childModel;
+      chain.push({ modelName, record, route: s });
       i += 2;
     }
     if (t !== reqToken) return;
+    // The outermost tabbed ancestor whose child segment matches one of its
+    // tabs anchors the page; anything deeper renders inside that tab.
+    for (let a = 0; a < chain.length - 1; a++) {
+      const anchorModel = state.project.models[chain[a].modelName];
+      const childRoute = chain[a + 1].route;
+      if (anchorModel.tabs?.some(tb => tb_route(tb) === childRoute)) {
+        showRecordInTab(chain, a, childRoute, t);
+        return;
+      }
+    }
     showRecord(modelName, record.key, record, tab);
   } catch (e) {
     if (t !== reqToken) return;
     fatal(e.message);
   }
+}
+
+// A child record shown inside its ancestor's tab: the ancestor's title and
+// tab bar stay, and a within-tab breadcrumb trail sits under the tabs.
+async function showRecordInTab(chain, anchorIndex, tabRoute, token) {
+  const t = token ?? ++reqToken;
+  const models = state.project.models;
+  const anchor = chain[anchorIndex];
+  const tail = chain.slice(anchorIndex + 1);
+  const leaf = tail[tail.length - 1];
+  const anchorModel = models[anchor.modelName];
+  const leafModel = models[leaf.modelName];
+  keepNavForRecord(anchor.modelName);
+  const hasOutputs = Object.keys(leafModel.outputs || {}).length > 0;
+  const [rels, outs] = await Promise.all([
+    api(`/api/models/${encodeURIComponent(leaf.modelName)}/record/relationships?key=${encodeURIComponent(leaf.record.key)}`).catch(() => ({ outbound: [], inbound: [] })),
+    hasOutputs
+      ? api(`/api/models/${encodeURIComponent(leaf.modelName)}/record/outputs?key=${encodeURIComponent(leaf.record.key)}`).catch(() => ({ outputs: [] }))
+      : Promise.resolve({ outputs: [] }),
+  ]);
+  if (t !== reqToken) return;
+  resetPageDynamics();
+  setHeader(recordTitle(anchor.record, anchorModel), '', recordActions(leaf.record));
+  $('#subtitle').innerHTML = `<span class="badge plain">${esc(anchorModel.label || anchorModel.name)}</span>`;
+  const trail = tail.map((entry, i) => {
+    const title = recordTitle(entry.record, models[entry.modelName]);
+    return i === tail.length - 1
+      ? `<span class="crumb-current">${esc(title)}</span>`
+      : `<a href="${recordHref(entry.record)}">${esc(title)}</a>`;
+  }).join('<span class="crumb-sep">›</span>');
+  const crumbs = `<div class="tab-crumbs"><span class="crumbs">${trail}</span><span class="badge plain">${esc(leafModel.label || leafModel.name)}</span></div>`;
+  const ctx = buildRecordCtx(leafModel, leaf.record, rels, outs);
+  const inner = renderDetailBlock(leafModel, ctx, 'detail');
+  $('#page').innerHTML = `${recordTabsBar(anchorModel, anchor.record, tabRoute)}${crumbs}<div class="detail">${inner}</div>`;
+  fillMarkdown();
+  wireDelete(leaf.record, recordTitle(leaf.record, leafModel));
 }
 
 function tb_route(tab) { return tab.route || tab.block; }
@@ -788,6 +837,34 @@ function resourceRecords(node, ctx) {
   return records;
 }
 
+// Depth-first order for a self-referencing record set: children group under
+// their parent (sibling order preserved from the sorted input); roots and
+// orphans stay at the top level.
+function treeDepths(records, related, treeField) {
+  const target = related.fields[treeField]?.reference?.field;
+  if (!target) return records.map(record => ({ record, depth: 0 }));
+  const ids = new Set(records.map(r => String(r.values[target])));
+  const children = new Map();
+  const roots = [];
+  for (const r of records) {
+    const p = r.values[treeField];
+    if (p != null && p !== '' && ids.has(String(p))) {
+      if (!children.has(String(p))) children.set(String(p), []);
+      children.get(String(p)).push(r);
+    } else {
+      roots.push(r);
+    }
+  }
+  const out = [];
+  const walk = (record, depth) => {
+    if (depth > 12) return;
+    out.push({ record, depth });
+    for (const child of children.get(String(record.values[target])) || []) walk(child, depth + 1);
+  };
+  roots.forEach(r => walk(r, 0));
+  return out;
+}
+
 // The reference field on the related model pointing at ctx.model, honoring
 // `via`; used to prefill create forms.
 function resourceRefField(node, ctx) {
@@ -861,7 +938,7 @@ function resourceNode(node, ctx, vars) {
         `<input type="checkbox" class="check-toggle" data-check="${index}"${done ? ' checked' : ''}>` +
         `<a href="${recordHref(r)}">${esc(recordTitle(r, related))}</a></label>`;
     }).join('');
-  } else if (display === 'table') {
+  } else if (display === 'table' || display === 'tree') {
     const columns = node.fields && node.fields.length
       ? node.fields.map(c => typeof c === 'string' ? { field: c } : c)
       : Object.keys(related.fields).slice(0, 3).map(field => ({ field }));
@@ -869,13 +946,17 @@ function resourceNode(node, ctx, vars) {
     const head = (expandable ? '<th class="expand-cell"></th>' : '') + columns.map(c =>
       `<th>${esc(c.label || related.fields[c.field]?.label || c.field)}</th>`).join('') +
       (expandable ? '<th class="details-cell"></th>' : '');
-    const rows = records.map(r => {
+    const depths = display === 'tree' ? treeDepths(records, related, node.tree) : null;
+    const ordered = depths ? depths.map(d => d.record) : records;
+    const rows = ordered.map((r, rowIndex) => {
+      const indent = depths ? '<span class="tree-indent"></span>'.repeat(depths[rowIndex].depth) : '';
       const cells = columns.map((c, i) => {
         const raw = c.field.startsWith('meta.') ? metaValue(r, c.field) : r.values[c.field];
         const formatted = c.format
           ? formatFieldValue(raw, related.fields[c.field], c, { model: related, record: r })
           : formatValue(raw, related.fields[c.field]);
-        const inner = raw == null || raw === '' ? '<span class="dash">—</span>' : formatted;
+        let inner = raw == null || raw === '' ? '<span class="dash">—</span>' : formatted;
+        if (i === 0) inner = indent + inner;
         // Expandable rows toggle on click, so the record link moves to a
         // Details cell instead of wrapping the first column.
         return i === 0 && !expandable
@@ -1278,13 +1359,16 @@ async function showRecord(modelName, key, prefetched, activeTab) {
         ? api(`/api/models/${encodeURIComponent(modelName)}/record/outputs?key=${encodeURIComponent(key)}`).catch(() => ({ outputs: [] }))
         : Promise.resolve({ outputs: [] }),
     ]);
-    const crumbs = await breadcrumbTrail(model, rels);
     if (t !== reqToken) return;
-    // Legacy #/records/ URLs rewrite themselves to the canonical nested URL.
+    // Legacy #/records/ URLs re-route to the canonical nested URL, which
+    // also picks in-tab rendering for records under a tabbed ancestor.
     const canonical = nestedHref(record);
     if (canonical && location.hash.startsWith('#/records/')) {
-      history.replaceState(null, '', canonical + (activeTab ? '/' + encodeURIComponent(activeTab) : ''));
+      location.replace(canonical);
+      return;
     }
+    const crumbs = await breadcrumbTrail(model, rels);
+    if (t !== reqToken) return;
     renderRecord(model, record, rels, outs, crumbs, activeTab);
   } catch (e) {
     if (t !== reqToken) return;
@@ -1318,10 +1402,7 @@ async function breadcrumbTrail(model, rels) {
 function renderRecord(model, record, rels, outs, crumbs = [], activeTab = null) {
   resetPageDynamics();
   const title = recordTitle(record, model);
-  const actions =
-    `<a class="btn" href="${recordHref(record)}/edit">Edit</a>` +
-    `<button class="btn danger" id="deleteBtn">Delete</button>`;
-  setHeader(title, '', actions);
+  setHeader(title, '', recordActions(record));
   // With a trail, the final segment is the record itself (its own title, not
   // the collection's label); without one, the model badge says what this is.
   $('#subtitle').innerHTML = crumbs.length
@@ -1330,41 +1411,60 @@ function renderRecord(model, record, rels, outs, crumbs = [], activeTab = null) 
       ).join('<span class="crumb-sep">›</span>')}<span class="crumb-sep">›</span><span class="crumb-current">${esc(title)}</span></span>`
     : `<span class="badge plain">${esc(model.label || model.name)}</span>`;
 
-  // Outbound reference links, resolved to canonical records where the
-  // relationships endpoint gives us a match on field name.
-  const outboundByField = new Map();
-  for (const link of (rels.outbound || [])) {
-    (outboundByField.get(link.field) || outboundByField.set(link.field, []).get(link.field)).push(link.record);
-  }
-
   // With tabs, each tab renders one display block and the first tab is the
   // default. Without them, a `detail` display block lays out the whole page;
   // without that, the default is a stacked label-over-value grid plus the
   // automatic related/outputs sections.
-  const ctx = { model, record, rels, outs, outboundByField, depth: 0 };
-  const renderBlock = name => {
-    const block = model.display?.[name];
-    return block
-      ? blockNodes(block).map(node => renderNode(node, ctx)).join('')
-      : defaultDetail(model, record, ctx) + relatedSection(model, rels) + outputsSection(model, outs);
-  };
+  const ctx = buildRecordCtx(model, record, rels, outs);
   let tabsBar = '';
   let inner;
   if (model.tabs?.length) {
-    const base = recordHref(record);
     const current = model.tabs.find(tb => tb_route(tb) === activeTab) || model.tabs[0];
-    tabsBar = `<div class="rec-tabs">` + model.tabs.map((tb, idx) => {
-      const href = idx === 0 ? base : `${base}/${encodeURIComponent(tb_route(tb))}`;
-      return `<a class="rec-tab${tb === current ? ' active' : ''}" href="${href}">${esc(tb.label)}</a>`;
-    }).join('') + `</div>`;
-    inner = renderBlock(current.block);
+    tabsBar = recordTabsBar(model, record, tb_route(current));
+    inner = renderDetailBlock(model, ctx, current.block);
   } else {
-    inner = renderBlock('detail');
+    inner = renderDetailBlock(model, ctx, 'detail');
   }
   $('#page').innerHTML = `${tabsBar}<div class="detail">${inner}</div>`;
   fillMarkdown();
+  wireDelete(record, title);
+}
 
-  $('#deleteBtn').onclick = async () => {
+// Outbound reference links, resolved to canonical records where the
+// relationships endpoint gives us a match on field name.
+function buildRecordCtx(model, record, rels, outs) {
+  const outboundByField = new Map();
+  for (const link of (rels?.outbound || [])) {
+    (outboundByField.get(link.field) || outboundByField.set(link.field, []).get(link.field)).push(link.record);
+  }
+  return { model, record, rels, outs, outboundByField, depth: 0 };
+}
+
+function renderDetailBlock(model, ctx, name) {
+  const block = model.display?.[name];
+  return block
+    ? blockNodes(block).map(node => renderNode(node, ctx)).join('')
+    : defaultDetail(model, ctx.record, ctx) + relatedSection(model, ctx.rels) + outputsSection(model, ctx.outs);
+}
+
+function recordTabsBar(model, record, activeRoute) {
+  if (!model.tabs?.length) return '';
+  const base = recordHref(record);
+  return `<div class="rec-tabs">` + model.tabs.map((tb, idx) => {
+    const href = idx === 0 ? base : `${base}/${encodeURIComponent(tb_route(tb))}`;
+    return `<a class="rec-tab${tb_route(tb) === activeRoute ? ' active' : ''}" href="${href}">${esc(tb.label)}</a>`;
+  }).join('') + `</div>`;
+}
+
+function recordActions(record) {
+  return `<a class="btn" href="${recordHref(record)}/edit">Edit</a>` +
+    `<button class="btn danger" id="deleteBtn">Delete</button>`;
+}
+
+function wireDelete(record, title) {
+  const btn = $('#deleteBtn');
+  if (!btn) return;
+  btn.onclick = async () => {
     if (!confirm(`Delete “${title}”? This removes it from disk.`)) return;
     try {
       await api(`/api/models/${encodeURIComponent(record.model)}/record?key=${encodeURIComponent(record.key)}&revision=${encodeURIComponent(record.revision)}`, { method: 'DELETE' });
