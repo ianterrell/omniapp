@@ -551,10 +551,7 @@ pub fn validate_routes(models: &BTreeMap<String, Model>) -> Vec<Problem> {
         if parent.route.is_none() {
             problems.push(Problem::new(
                 &location,
-                format!(
-                    "nested route needs a route on parent model {}",
-                    parent.name
-                ),
+                format!("nested route needs a route on parent model {}", parent.name),
             ));
         }
         if parent.identity.as_deref() != Some(reference.field.as_str()) {

@@ -6,8 +6,8 @@ use std::sync::{LazyLock, RwLock};
 use chrono::{DateTime, NaiveDate};
 use omniapp_schema::{
     Field, FieldSource, FieldType, Model, Problem, ProjectConfig, Storage, View, is_safe_relative,
-    read_yaml, validate_config, validate_display_references, validate_model, validate_navigation, validate_routes,
-    validate_view,
+    read_yaml, validate_config, validate_display_references, validate_model, validate_navigation,
+    validate_routes, validate_view,
 };
 use rayon::prelude::*;
 use regex::Regex;
