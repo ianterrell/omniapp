@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use minijinja::Value;
 use minijinja::value::{Enumerator, Object, ObjectRepr};
-use omniapp_core::{Record, execute_query_all, render_path_template};
+use omniapp_core::{Record, execute_query_all_with_relations, render_path_template};
 use omniapp_schema::{Model, Query, Reference};
 
 /// A parsed permalink template. The trailing slash decides whether the record
@@ -123,7 +123,13 @@ impl SiteData {
             .get(model)
             .map(|records| records.iter().map(|record| (**record).clone()).collect())
             .unwrap_or_default();
-        execute_query_all(&owned, query)
+        let all_records = self
+            .by_model
+            .values()
+            .flatten()
+            .map(|record| (**record).clone())
+            .collect::<Vec<_>>();
+        execute_query_all_with_relations(&owned, &all_records, &self.models, query)
             .into_iter()
             .map(Arc::new)
             .collect()

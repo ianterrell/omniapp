@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 
-use omniapp_schema::{Direction, Filter, FilterOp, Query};
+use omniapp_schema::{Direction, Filter, FilterOp, Model, Query};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -17,9 +18,22 @@ pub struct Page {
 
 #[must_use]
 pub fn execute_query(records: &[Record], query: &Query, page: usize) -> Page {
+    execute_query_with_relations(records, records, &BTreeMap::new(), query, page)
+}
+
+/// Apply a query while allowing dotted fields to traverse single-valued
+/// references, for example `book.publication_state`.
+#[must_use]
+pub fn execute_query_with_relations(
+    records: &[Record],
+    all_records: &[Record],
+    models: &BTreeMap<String, Model>,
+    query: &Query,
+    page: usize,
+) -> Page {
     let page = page.max(1);
     let page_size = query.page_size.clamp(1, 1000);
-    let matches = execute_query_all(records, query);
+    let matches = execute_query_all_with_relations(records, all_records, models, query);
     let total = matches.len();
     let pages = total.div_ceil(page_size);
     let start = (page - 1).saturating_mul(page_size).min(total);
@@ -36,13 +50,25 @@ pub fn execute_query(records: &[Record], query: &Query, page: usize) -> Page {
 /// Apply a query's filters and order without pagination.
 #[must_use]
 pub fn execute_query_all(records: &[Record], query: &Query) -> Vec<Record> {
+    execute_query_all_with_relations(records, records, &BTreeMap::new(), query)
+}
+
+/// Apply a query without pagination, resolving dotted fields through
+/// single-valued references declared by the models.
+#[must_use]
+pub fn execute_query_all_with_relations(
+    records: &[Record],
+    all_records: &[Record],
+    models: &BTreeMap<String, Model>,
+    query: &Query,
+) -> Vec<Record> {
     let mut matches: Vec<Record> = records
         .iter()
         .filter(|record| {
             query
                 .filters
                 .iter()
-                .all(|filter| matches_filter(record, filter))
+                .all(|filter| matches_filter(record, filter, all_records, models))
         })
         .cloned()
         .collect();
@@ -50,8 +76,8 @@ pub fn execute_query_all(records: &[Record], query: &Query) -> Vec<Record> {
     matches.sort_by(|left, right| {
         for order in &query.order {
             let ordering = compare_values(
-                left.values.get(&order.field),
-                right.values.get(&order.field),
+                resolve_value(left, &order.field, all_records, models),
+                resolve_value(right, &order.field, all_records, models),
             );
             let ordering = match order.direction {
                 Direction::Asc => ordering,
@@ -66,11 +92,14 @@ pub fn execute_query_all(records: &[Record], query: &Query) -> Vec<Record> {
     matches
 }
 
-fn matches_filter(record: &Record, filter: &Filter) -> bool {
-    let actual = record
-        .values
-        .get(&filter.field)
-        .filter(|value| !value.is_null());
+fn matches_filter(
+    record: &Record,
+    filter: &Filter,
+    all_records: &[Record],
+    models: &BTreeMap<String, Model>,
+) -> bool {
+    let actual =
+        resolve_value(record, &filter.field, all_records, models).filter(|value| !value.is_null());
     match filter.op {
         FilterOp::IsNull => actual.is_none(),
         FilterOp::IsNotNull => actual.is_some(),
@@ -90,6 +119,32 @@ fn matches_filter(record: &Record, filter: &Filter) -> bool {
             _ => false,
         },
     }
+}
+
+fn resolve_value<'a>(
+    record: &'a Record,
+    field_path: &str,
+    all_records: &'a [Record],
+    models: &BTreeMap<String, Model>,
+) -> Option<&'a Value> {
+    let mut current = record;
+    let mut segments = field_path.split('.').peekable();
+    while let Some(segment) = segments.next() {
+        let value = current.values.get(segment)?;
+        if segments.peek().is_none() {
+            return Some(value);
+        }
+        let field = models.get(&current.model)?.fields.get(segment)?;
+        let reference = field
+            .reference
+            .as_ref()
+            .filter(|reference| !reference.many)?;
+        current = all_records.iter().find(|candidate| {
+            candidate.model == reference.model
+                && candidate.values.get(&reference.field) == Some(value)
+        })?;
+    }
+    None
 }
 
 fn compare_values(left: Option<&Value>, right: Option<&Value>) -> Ordering {
@@ -159,10 +214,87 @@ mod tests {
         assert_eq!(second.records[0].key, "a");
     }
 
+    #[test]
+    fn filters_through_single_valued_references() {
+        let todo_model: Model = serde_yaml::from_str(
+            r#"
+version: 1
+name: Todo
+storage: { kind: file, path: "todos/{id}.md" }
+fields:
+  id: { type: string, source: { kind: path, variable: id } }
+  done: { type: boolean, source: { kind: frontmatter, key: done } }
+  book:
+    type: reference
+    source: { kind: frontmatter, key: book }
+    reference: { model: Book, field: slug }
+"#,
+        )
+        .unwrap();
+        let book_model: Model = serde_yaml::from_str(
+            r#"
+version: 1
+name: Book
+storage: { kind: directory, path: "books/{slug}" }
+fields:
+  slug: { type: string, source: { kind: path, variable: slug } }
+  publication_state: { type: string, source: { kind: yaml, file: book.yml, key: publication_state } }
+"#,
+        )
+        .unwrap();
+        let models = BTreeMap::from([
+            ("Todo".to_owned(), todo_model),
+            ("Book".to_owned(), book_model),
+        ]);
+        let todos = vec![
+            typed_record("active", "Todo", json!({"done": false, "book": "active"})),
+            typed_record(
+                "archived",
+                "Todo",
+                json!({"done": false, "book": "archived"}),
+            ),
+            typed_record("general", "Todo", json!({"done": false})),
+        ];
+        let mut all_records = todos.clone();
+        all_records.extend([
+            typed_record(
+                "active",
+                "Book",
+                json!({"slug": "active", "publication_state": "draft"}),
+            ),
+            typed_record(
+                "archived",
+                "Book",
+                json!({"slug": "archived", "publication_state": "archived"}),
+            ),
+        ]);
+        let query = Query {
+            filters: vec![Filter {
+                field: "book.publication_state".into(),
+                op: FilterOp::NotEq,
+                value: Some(json!("archived")),
+            }],
+            order: vec![],
+            page_size: 50,
+        };
+        let page = execute_query_with_relations(&todos, &all_records, &models, &query, 1);
+        assert_eq!(
+            page.records
+                .iter()
+                .map(|record| record.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["active", "general"]
+        );
+    }
+
     fn record(key: &str, values: Value) -> Record {
+        typed_record(key, "Post", values)
+    }
+
+    fn typed_record(key: &str, model: &str, values: Value) -> Record {
         Record {
             key: key.into(),
-            model: "Post".into(),
+            model: model.into(),
             path: PathBuf::new(),
             revision: "test".into(),
             values: serde_json::from_value::<BTreeMap<String, Value>>(values).unwrap(),

@@ -4,7 +4,10 @@ use std::io::{self, Read};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use omniapp_core::{Cache, Page, Record, RecordInput, SearchHit, Workspace, execute_query};
+use omniapp_core::{
+    Cache, Page, Record, RecordInput, SearchHit, Workspace, execute_query,
+    execute_query_with_relations,
+};
 use omniapp_schema::{FieldType, Model, Query};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -165,21 +168,34 @@ pub fn query(
         ensure_page_size(page_size)?;
     }
     let workspace = Workspace::new(path);
-    let loaded = workspace.load()?;
-    let view = loaded
+    let snapshot = workspace.snapshot()?;
+    let view = snapshot
+        .loaded
         .views
         .get(view_name)
         .with_context(|| format!("unknown view {view_name:?}"))?;
-    let model = loaded
+    let model = snapshot
+        .loaded
         .models
         .get(&view.model)
         .with_context(|| format!("view references unknown model {:?}", view.model))?;
-    let records = workspace.records(model)?;
+    let records = snapshot
+        .records
+        .iter()
+        .filter(|record| record.model == model.name)
+        .cloned()
+        .collect::<Vec<_>>();
     let mut record_query = view.query.clone();
     if let Some(page_size) = page_size {
         record_query.page_size = page_size;
     }
-    let result = execute_query(&records, &record_query, page);
+    let result = execute_query_with_relations(
+        &records,
+        &snapshot.records,
+        &snapshot.loaded.models,
+        &record_query,
+        page,
+    );
     if json {
         print_json(&result)
     } else {

@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use omniapp_schema::{Direction, FilterOp, Query};
+use omniapp_schema::{Direction, FilterOp, Model, Query};
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, Row, params, params_from_iter};
 use serde::Serialize;
@@ -16,6 +17,8 @@ pub enum CacheError {
     Database(#[from] rusqlite::Error),
     #[error("could not serialize record for cache: {0}")]
     Serialize(#[from] serde_json::Error),
+    #[error("invalid relational query field {0:?}")]
+    InvalidFieldPath(String),
 }
 
 pub struct Cache {
@@ -238,6 +241,30 @@ impl Cache {
         page: usize,
         search: Option<&str>,
     ) -> Result<Page, CacheError> {
+        self.query_internal(model, None, query, page, search)
+    }
+
+    /// Run a declarative query whose filter and order fields may traverse
+    /// single-valued references with dotted paths.
+    pub fn query_with_relations(
+        &self,
+        model: &str,
+        models: &BTreeMap<String, Model>,
+        query: &Query,
+        page: usize,
+        search: Option<&str>,
+    ) -> Result<Page, CacheError> {
+        self.query_internal(model, Some(models), query, page, search)
+    }
+
+    fn query_internal(
+        &self,
+        model: &str,
+        models: Option<&BTreeMap<String, Model>>,
+        query: &Query,
+        page: usize,
+        search: Option<&str>,
+    ) -> Result<Page, CacheError> {
         let page = page.max(1);
         let page_size = query.page_size.clamp(1, 1000);
         let mut clauses = vec!["model = ?".to_owned()];
@@ -256,15 +283,14 @@ impl Cache {
         }
 
         for filter in &query.filters {
-            let path = json_path(&filter.field);
             let expression = match filter.op {
                 FilterOp::IsNull => {
-                    parameters.push(SqlValue::Text(path));
-                    "COALESCE(json_type(data, ?), 'null') = 'null'".to_owned()
+                    let field = field_expression(model, models, &filter.field, &mut parameters)?;
+                    format!("({field}) IS NULL")
                 }
                 FilterOp::IsNotNull => {
-                    parameters.push(SqlValue::Text(path));
-                    "COALESCE(json_type(data, ?), 'null') <> 'null'".to_owned()
+                    let field = field_expression(model, models, &filter.field, &mut parameters)?;
+                    format!("({field}) IS NOT NULL")
                 }
                 FilterOp::In => {
                     let options = filter
@@ -276,7 +302,8 @@ impl Cache {
                     if options.is_empty() {
                         "0".to_owned()
                     } else {
-                        parameters.push(SqlValue::Text(path));
+                        let field =
+                            field_expression(model, models, &filter.field, &mut parameters)?;
                         let placeholders = options
                             .into_iter()
                             .map(|value| {
@@ -285,29 +312,31 @@ impl Cache {
                             })
                             .collect::<Vec<_>>()
                             .join(", ");
-                        format!("json_extract(data, ?) IN ({placeholders})")
+                        format!("{field} IN ({placeholders})")
                     }
                 }
                 FilterOp::Contains => {
                     let value = filter.value.clone().unwrap_or(Value::Null).to_string();
-                    parameters.extend([
-                        SqlValue::Text(path.clone()),
-                        SqlValue::Text(path.clone()),
-                        SqlValue::Text(value.clone()),
-                        SqlValue::Text(path),
-                        SqlValue::Text(value),
-                    ]);
-                    "(CASE json_type(data, ?)
+                    let type_field =
+                        field_expression(model, models, &filter.field, &mut parameters)?;
+                    let array_field =
+                        field_expression(model, models, &filter.field, &mut parameters)?;
+                    parameters.push(SqlValue::Text(value.clone()));
+                    let text_field =
+                        field_expression(model, models, &filter.field, &mut parameters)?;
+                    parameters.push(SqlValue::Text(value));
+                    format!(
+                        "(CASE json_type({type_field})
                        WHEN 'array' THEN EXISTS (
-                         SELECT 1 FROM json_each(json_extract(data, ?))
+                         SELECT 1 FROM json_each({array_field})
                          WHERE value IS json_extract(?, '$')
                        )
-                       ELSE instr(CAST(json_extract(data, ?) AS TEXT), CAST(json_extract(?, '$') AS TEXT)) > 0
+                       ELSE instr(CAST({text_field} AS TEXT), CAST(json_extract(?, '$') AS TEXT)) > 0
                      END)"
-                        .to_owned()
+                    )
                 }
                 operator => {
-                    parameters.push(SqlValue::Text(path));
+                    let field = field_expression(model, models, &filter.field, &mut parameters)?;
                     parameters.push(SqlValue::Text(
                         filter.value.clone().unwrap_or(Value::Null).to_string(),
                     ));
@@ -323,7 +352,7 @@ impl Cache {
                         | FilterOp::IsNull
                         | FilterOp::IsNotNull => unreachable!(),
                     };
-                    format!("json_extract(data, ?) {operator} json_extract(?, '$')")
+                    format!("{field} {operator} json_extract(?, '$')")
                 }
             };
             clauses.push(expression);
@@ -339,12 +368,12 @@ impl Cache {
 
         let mut order_parts = Vec::new();
         for order in &query.order {
-            parameters.push(SqlValue::Text(json_path(&order.field)));
+            let field = field_expression(model, models, &order.field, &mut parameters)?;
             let direction = match order.direction {
                 Direction::Asc => "ASC",
                 Direction::Desc => "DESC",
             };
-            order_parts.push(format!("json_extract(data, ?) {direction}"));
+            order_parts.push(format!("{field} {direction}"));
         }
         order_parts.push("record_key ASC".to_owned());
         parameters.push(SqlValue::Integer(
@@ -474,6 +503,76 @@ fn json_path(field: &str) -> String {
     format!("$.\"{}\"", field.replace('"', "\\\""))
 }
 
+fn field_expression(
+    root_model: &str,
+    models: Option<&BTreeMap<String, Model>>,
+    field_path: &str,
+    parameters: &mut Vec<SqlValue>,
+) -> Result<String, CacheError> {
+    let segments = field_path.split('.').collect::<Vec<_>>();
+    if segments.len() == 1 {
+        parameters.push(SqlValue::Text(json_path(field_path)));
+        return Ok("json_extract(records.data, ?)".to_owned());
+    }
+    let models = models.ok_or_else(|| CacheError::InvalidFieldPath(field_path.to_owned()))?;
+    let mut current_model = models
+        .get(root_model)
+        .ok_or_else(|| CacheError::InvalidFieldPath(field_path.to_owned()))?;
+    let mut steps = Vec::new();
+    for segment in &segments[..segments.len() - 1] {
+        let field = current_model
+            .fields
+            .get(*segment)
+            .ok_or_else(|| CacheError::InvalidFieldPath(field_path.to_owned()))?;
+        let reference = field
+            .reference
+            .as_ref()
+            .filter(|reference| !reference.many)
+            .ok_or_else(|| CacheError::InvalidFieldPath(field_path.to_owned()))?;
+        steps.push((
+            (*segment).to_owned(),
+            reference.model.clone(),
+            reference.field.clone(),
+        ));
+        current_model = models
+            .get(&reference.model)
+            .ok_or_else(|| CacheError::InvalidFieldPath(field_path.to_owned()))?;
+    }
+    let final_field = segments[segments.len() - 1];
+    if !current_model.fields.contains_key(final_field) {
+        return Err(CacheError::InvalidFieldPath(field_path.to_owned()));
+    }
+
+    parameters.push(SqlValue::Text(json_path(final_field)));
+    let final_alias = format!("related_{}", steps.len() - 1);
+    let mut sql = format!("(SELECT json_extract({final_alias}.data, ?) FROM records AS related_0");
+    for (index, (source_field, target_model, target_field)) in steps.iter().enumerate().skip(1) {
+        let source_alias = format!("related_{}", index - 1);
+        let target_alias = format!("related_{index}");
+        parameters.extend([
+            SqlValue::Text(target_model.clone()),
+            SqlValue::Text(json_path(target_field)),
+            SqlValue::Text(json_path(source_field)),
+        ]);
+        let _ = write!(
+            sql,
+            " JOIN records AS {target_alias} ON {target_alias}.model = ? \
+             AND json_extract({target_alias}.data, ?) IS json_extract({source_alias}.data, ?)"
+        );
+    }
+    let (source_field, target_model, target_field) = &steps[0];
+    parameters.extend([
+        SqlValue::Text(target_model.clone()),
+        SqlValue::Text(json_path(target_field)),
+        SqlValue::Text(json_path(source_field)),
+    ]);
+    sql.push_str(
+        " WHERE related_0.model = ? \
+         AND json_extract(related_0.data, ?) IS json_extract(records.data, ?) LIMIT 1)",
+    );
+    Ok(sql)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -560,6 +659,85 @@ mod tests {
     }
 
     #[test]
+    fn cached_queries_filter_through_references() {
+        let directory = tempdir().unwrap();
+        let mut cache = Cache::open(&directory.path().join("cache.sqlite3")).unwrap();
+        cache
+            .rebuild(&[
+                typed_record(
+                    "active-todo",
+                    "Todo",
+                    json!({"done": false, "book": "active"}),
+                ),
+                typed_record(
+                    "archived-todo",
+                    "Todo",
+                    json!({"done": false, "book": "archived"}),
+                ),
+                typed_record("general-todo", "Todo", json!({"done": false})),
+                typed_record(
+                    "active",
+                    "Book",
+                    json!({"slug": "active", "publication_state": "draft"}),
+                ),
+                typed_record(
+                    "archived",
+                    "Book",
+                    json!({"slug": "archived", "publication_state": "archived"}),
+                ),
+            ])
+            .unwrap();
+        let todo_model: Model = serde_yaml::from_str(
+            r#"
+version: 1
+name: Todo
+storage: { kind: file, path: "todos/{id}.md" }
+fields:
+  id: { type: string, source: { kind: path, variable: id } }
+  book:
+    type: reference
+    source: { kind: frontmatter, key: book }
+    reference: { model: Book, field: slug }
+"#,
+        )
+        .unwrap();
+        let book_model: Model = serde_yaml::from_str(
+            r#"
+version: 1
+name: Book
+storage: { kind: directory, path: "books/{slug}" }
+fields:
+  slug: { type: string, source: { kind: path, variable: slug } }
+  publication_state: { type: string, source: { kind: yaml, file: book.yml, key: publication_state } }
+"#,
+        )
+        .unwrap();
+        let models = BTreeMap::from([
+            ("Todo".to_owned(), todo_model),
+            ("Book".to_owned(), book_model),
+        ]);
+        let query = Query {
+            filters: vec![Filter {
+                field: "book.publication_state".into(),
+                op: FilterOp::NotEq,
+                value: Some(json!("archived")),
+            }],
+            order: vec![],
+            page_size: 50,
+        };
+        let page = cache
+            .query_with_relations("Todo", &models, &query, 1, None)
+            .unwrap();
+        assert_eq!(
+            page.records
+                .iter()
+                .map(|record| record.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["active-todo", "general-todo"]
+        );
+    }
+
+    #[test]
     fn substring_search_spans_all_pages_and_respects_filters() {
         let directory = tempdir().unwrap();
         let mut cache = Cache::open(&directory.path().join("cache.sqlite3")).unwrap();
@@ -608,11 +786,15 @@ mod tests {
     }
 
     fn record(key: &str, values: Value) -> (Record, String) {
+        typed_record(key, "Post", values)
+    }
+
+    fn typed_record(key: &str, model: &str, values: Value) -> (Record, String) {
         (
             Record {
                 key: key.into(),
-                model: "Post".into(),
-                path: PathBuf::from(format!("posts/{key}.md")),
+                model: model.into(),
+                path: PathBuf::from(format!("{model}/{key}.md")),
                 revision: "test".into(),
                 values: serde_json::from_value(values).unwrap(),
             },

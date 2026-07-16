@@ -433,8 +433,9 @@ async fn model_records(
         ..RecordQuery::default()
     };
     let cache = Cache::open(&state.workspace.metadata_dir().join("cache.sqlite3"))?;
-    Ok(Json(serde_json::to_value(cache.query(
+    Ok(Json(serde_json::to_value(cache.query_with_relations(
         &model.name,
+        &loaded.models,
         &query,
         params.page,
         params.q.as_deref(),
@@ -463,8 +464,9 @@ async fn view_records(
         .filters
         .extend(parse_filters(params.filter.as_deref(), model)?);
     let cache = Cache::open(&state.workspace.metadata_dir().join("cache.sqlite3"))?;
-    Ok(Json(serde_json::to_value(cache.query(
+    Ok(Json(serde_json::to_value(cache.query_with_relations(
         &model.name,
+        &loaded.models,
         &query,
         params.page,
         params.q.as_deref(),

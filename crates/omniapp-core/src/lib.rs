@@ -13,7 +13,10 @@ mod yaml_edit;
 pub use cache::{Cache, CacheError, SearchHit};
 pub use document::MarkdownDocument;
 pub use output::{GeneratedOutput, OutputSet};
-pub use query::{Page, execute_query, execute_query_all};
+pub use query::{
+    Page, execute_query, execute_query_all, execute_query_all_with_relations,
+    execute_query_with_relations,
+};
 pub use record::{Record, RecordInput};
 pub use relationship::{RelationshipLink, RelationshipSet};
 pub use watcher::{WatchObserver, WatcherError, WorkspaceWatcher};

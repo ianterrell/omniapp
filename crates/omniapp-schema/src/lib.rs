@@ -925,11 +925,16 @@ pub fn validate_view(view: &View, models: &BTreeMap<String, Model>) -> Vec<Probl
             ));
         }
     };
+    let check_query_field = |field: &str, suffix: &str, problems: &mut Vec<Problem>| {
+        if let Err(message) = validate_query_field_path(model, field, models) {
+            problems.push(Problem::new(format!("{location}.{suffix}"), message));
+        }
+    };
     for field in &view.fields {
         check_field(field, "fields", &mut problems);
     }
     for filter in &view.query.filters {
-        check_field(&filter.field, "query.filters", &mut problems);
+        check_query_field(&filter.field, "query.filters", &mut problems);
         let needs_value = !matches!(filter.op, FilterOp::IsNull | FilterOp::IsNotNull);
         if needs_value != filter.value.is_some() {
             problems.push(Problem::new(
@@ -943,7 +948,7 @@ pub fn validate_view(view: &View, models: &BTreeMap<String, Model>) -> Vec<Probl
         }
     }
     for order in &view.query.order {
-        check_field(&order.field, "query.order", &mut problems);
+        check_query_field(&order.field, "query.order", &mut problems);
     }
     if let Some(group_by) = &view.group_by {
         check_field(group_by, "group_by", &mut problems);
@@ -966,6 +971,52 @@ pub fn validate_view(view: &View, models: &BTreeMap<String, Model>) -> Vec<Probl
         ));
     }
     problems
+}
+
+fn validate_query_field_path(
+    root_model: &Model,
+    field_path: &str,
+    models: &BTreeMap<String, Model>,
+) -> Result<(), String> {
+    let mut model = root_model;
+    let mut segments = field_path.split('.').peekable();
+    while let Some(segment) = segments.next() {
+        if segment.is_empty() {
+            return Err(format!(
+                "invalid empty segment in field path {field_path:?}"
+            ));
+        }
+        let Some(field) = model.fields.get(segment) else {
+            return Err(format!(
+                "unknown field {segment:?} on model {} while resolving {field_path:?}",
+                model.name
+            ));
+        };
+        if segments.peek().is_some() {
+            let Some(reference) = &field.reference else {
+                return Err(format!(
+                    "field {segment:?} on model {} is not a reference and cannot be traversed",
+                    model.name
+                ));
+            };
+            if reference.many {
+                return Err(format!(
+                    "many-valued reference {segment:?} on model {} cannot be traversed in a query",
+                    model.name
+                ));
+            }
+            model = models.get(&reference.model).ok_or_else(|| {
+                format!(
+                    "reference field {segment:?} points to unknown model {:?}",
+                    reference.model
+                )
+            })?;
+        }
+    }
+    if field_path.is_empty() {
+        return Err("field path cannot be empty".to_owned());
+    }
+    Ok(())
 }
 
 #[must_use]
@@ -1126,6 +1177,67 @@ fields:
             validate_routes(&models)
                 .iter()
                 .any(|p| p.message.contains("must declare identity"))
+        );
+    }
+
+    #[test]
+    fn validates_query_fields_through_references() {
+        let book: Model = serde_yaml::from_str(
+            r#"
+version: 1
+name: Book
+storage: { kind: directory, path: "books/{slug}" }
+fields:
+  slug: { type: string, source: { kind: path, variable: slug } }
+  publication_state: { type: string, source: { kind: yaml, file: book.yml, key: publication_state } }
+"#,
+        )
+        .unwrap();
+        let todo: Model = serde_yaml::from_str(
+            r#"
+version: 1
+name: Todo
+storage: { kind: file, path: "todos/{id}.md" }
+fields:
+  id: { type: string, source: { kind: path, variable: id } }
+  book:
+    type: reference
+    source: { kind: frontmatter, key: book }
+    reference: { model: Book, field: slug }
+"#,
+        )
+        .unwrap();
+        let models = BTreeMap::from([("Book".to_owned(), book), ("Todo".to_owned(), todo)]);
+        let valid: View = serde_yaml::from_str(
+            r"
+version: 1
+name: active-todos
+model: Todo
+type: table
+query:
+  filters:
+    - { field: book.publication_state, op: not_eq, value: archived }
+",
+        )
+        .unwrap();
+        assert_eq!(validate_view(&valid, &models), Vec::new());
+
+        let invalid: View = serde_yaml::from_str(
+            r"
+version: 1
+name: invalid
+model: Todo
+type: table
+query:
+  filters:
+    - { field: id.publication_state, op: not_eq, value: archived }
+",
+        )
+        .unwrap();
+        assert!(
+            validate_view(&invalid, &models)
+                .iter()
+                .any(|problem| { problem.message.contains("is not a reference") })
         );
     }
 
