@@ -191,7 +191,7 @@ Filter operators are `eq`, `not_eq`, `lt`, `lte`, `gt`, `gte`, `contains`, `in`,
 Each view type has a dedicated renderer in the admin application:
 
 - `table`: sortable columns from `fields`; reference cells link to the referenced record's page.
-- `board`: kanban columns from the `group_by` field's enum choices (plus a trailing column for records without a value, and appended columns for unexpected values).
+- `board`: kanban columns from the `group_by` field's enum choices (plus a trailing column for records without a value, and appended columns for unexpected values). Cards are draggable between columns; dropping a card writes the destination column's value to the record's `group_by` field (the trailing column clears it).
 - `cards`: a card grid; each record renders through its display block (see Display below), falling back to a built-in card whose image is the first `asset` field.
 - `calendar`: a month grid keyed on the first date-typed `query.order` field (else the first date-typed view field); undated records collect in a strip below.
 - `timeline`: a chronological list with date markers, in query order.

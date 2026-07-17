@@ -1242,6 +1242,8 @@ function wireDynamic(view, model, result) {
   if (view.type === 'calendar') {
     const mount = $('#calMount');
     if (mount) renderCalendar(mount, view, model, result.records);
+  } else if (view.type === 'board') {
+    wireBoard();
   }
 }
 
@@ -1283,17 +1285,108 @@ function renderBoard(view, model, records) {
     (buckets.get(v) || buckets.set(v, []).get(v)).push(r);
   }
   order.push(NONE);
+  const block = itemBlock(view, model);
+  // Each card is a draggable handle carrying the record's key and revision,
+  // which wireBoard() needs to persist a move.
+  const card = r =>
+    `<div class="board-card" draggable="true" data-key="${esc(r.key)}" data-revision="${esc(r.revision ?? '')}">` +
+    `${block ? recordItem(r, model, block) : recordCard(r, model, viewFields(view, model))}</div>`;
   const cols = order.map(v => {
     const items = buckets.get(v) || [];
     if (!items.length && v === NONE) return '';
     const title = v === NONE ? `No ${esc(label.toLowerCase())}` : esc(v);
-    const block = itemBlock(view, model);
-    const cards = items.length
-      ? items.map(r => block ? recordItem(r, model, block) : recordCard(r, model, viewFields(view, model))).join('')
-      : '<div class="board-empty">Empty</div>';
-    return `<div class="board-col"><div class="board-col-head"><span>${title}</span><span class="n">${items.length}</span></div>${cards}</div>`;
+    // The value a card takes on when dropped here ('' clears the field).
+    const value = v === NONE ? '' : v;
+    const cards = items.map(card).join('') || '<div class="board-empty">Empty</div>';
+    return `<div class="board-col" data-value="${esc(value)}">` +
+      `<div class="board-col-head"><span>${title}</span><span class="n">${items.length}</span></div>` +
+      `<div class="board-col-body">${cards}</div></div>`;
   }).join('');
-  return `<div class="board">${cols}</div>`;
+  return `<div class="board" data-model="${esc(model.name)}" data-field="${esc(gb)}">${cols}</div>`;
+}
+
+// Wire the board's drag-and-drop: dropping a card on a column writes that
+// column's value to the record's group_by field through the merge-update API,
+// with an optimistic move that reverts if the write fails.
+function wireBoard() {
+  const board = $('#viewBody .board');
+  if (!board) return;
+  const { model: modelName, field } = board.dataset;
+  // Links inside a card are draggable by default and would become the drag
+  // source (dragging their URL); the wrapper owns the drag instead.
+  board.querySelectorAll('.board-card a').forEach(a => { a.draggable = false; });
+
+  let dragCard = null;
+  board.addEventListener('dragstart', e => {
+    const card = e.target.closest('.board-card');
+    if (!card) return;
+    dragCard = card;
+    card.classList.add('dragging');
+    e.dataTransfer.effectAllowed = 'move';
+    try { e.dataTransfer.setData('text/plain', card.dataset.key); } catch { /* Safari */ }
+  });
+  board.addEventListener('dragend', () => {
+    if (dragCard) dragCard.classList.remove('dragging');
+    dragCard = null;
+    board.querySelectorAll('.drag-over').forEach(c => c.classList.remove('drag-over'));
+  });
+  board.querySelectorAll('.board-col').forEach(col => {
+    col.addEventListener('dragover', e => {
+      if (!dragCard) return; // ignore drags that didn't start on a card
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      col.classList.add('drag-over');
+    });
+    col.addEventListener('dragleave', e => {
+      if (!col.contains(e.relatedTarget)) col.classList.remove('drag-over');
+    });
+    col.addEventListener('drop', e => {
+      if (!dragCard) return;
+      e.preventDefault();
+      col.classList.remove('drag-over');
+      if (dragCard.closest('.board-col') !== col) moveBoardCard(dragCard, col, modelName, field);
+    });
+  });
+}
+
+// Move a card to a column: patch the DOM immediately, then persist. On failure
+// the card returns to its origin. The saved record's key/revision replace the
+// card's (updating group_by can change both when it feeds the storage path).
+async function moveBoardCard(card, col, modelName, field) {
+  const from = card.closest('.board-col');
+  const value = col.dataset.value; // '' → clear the field (the "none" column)
+  card.classList.add('saving');
+  col.querySelector('.board-col-body').appendChild(card);
+  updateBoardCounts(from);
+  updateBoardCounts(col);
+  try {
+    const saved = await api(`/api/models/${encodeURIComponent(modelName)}/record?key=${encodeURIComponent(card.dataset.key)}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ revision: card.dataset.revision, values: { [field]: value === '' ? null : value } }),
+    });
+    card.dataset.key = saved.key;
+    card.dataset.revision = saved.revision ?? '';
+    card.classList.remove('saving');
+  } catch (e) {
+    from.querySelector('.board-col-body').appendChild(card);
+    updateBoardCounts(from);
+    updateBoardCounts(col);
+    card.classList.remove('saving');
+    alert(e.message);
+  }
+}
+
+// Refresh a column's count badge and its empty placeholder after cards move.
+function updateBoardCounts(col) {
+  if (!col) return;
+  const body = col.querySelector('.board-col-body');
+  const cards = body.querySelectorAll('.board-card');
+  const badge = col.querySelector('.board-col-head .n');
+  if (badge) badge.textContent = cards.length;
+  const empty = body.querySelector('.board-empty');
+  if (!cards.length && !empty) body.insertAdjacentHTML('beforeend', '<div class="board-empty">Empty</div>');
+  else if (cards.length && empty) empty.remove();
 }
 
 /* ---- cards ---- */

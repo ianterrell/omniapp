@@ -125,9 +125,14 @@ tbody tr:hover { background:#f8faf8 }
 .board-col-head { display:flex; align-items:baseline; justify-content:space-between; gap:8px;
   margin:2px 4px 11px; font-weight:650 }
 .board-col-head .n { color:var(--muted); font-weight:600; font-size:12px }
-.board-col .card { margin-bottom:10px }
-.board-col .card:last-child { margin-bottom:0 }
-.board-empty { color:#9aa39f; font-size:13px; padding:10px 4px }
+.board-col-body { min-height:36px }
+.board-card { margin-bottom:10px; cursor:grab }
+.board-card:last-child { margin-bottom:0 }
+.board-card.dragging { opacity:.4 }
+.board-card.saving { opacity:.55; pointer-events:none }
+.board-col.drag-over { border-color:var(--accent); background:var(--accent-soft) }
+.board-empty { color:#9aa39f; font-size:13px; padding:10px 4px; border-radius:8px; border:1px dashed transparent }
+.board-col.drag-over .board-empty { border-color:var(--accent) }
 
 /* ---------- Calendar ---------- */
 .cal-head { display:flex; align-items:center; gap:12px; margin-bottom:12px }
