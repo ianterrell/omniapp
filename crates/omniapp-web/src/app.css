@@ -250,6 +250,9 @@ pre.json { background:#fafbf9; border:1px solid var(--line); border-radius:8px; 
 .table-shell.mini td.plain { padding:11px 15px }
 .item-link { display:block; color:inherit; min-width:0 }
 .item-link:hover .dcard { border-color:#c3ccc7; box-shadow:0 4px 16px #21372d14 }
+.item-card { min-width:0 }
+.d-title a { color:inherit; text-decoration:none }
+.d-title a:hover { text-decoration:underline }
 
 /* Related tabs */
 .related { margin-top:32px }

@@ -363,6 +363,7 @@ async function showRecordInTab(chain, anchorIndex, tabRoute, token) {
   const inner = renderDetailBlock(leafModel, ctx, 'detail');
   $('#page').innerHTML = `${recordTabsBar(anchorModel, anchor.record, tabRoute)}${crumbs}<div class="detail">${inner}</div>`;
   fillMarkdown();
+  fillResources();
   wireDelete(leaf.record, recordTitle(leaf.record, leafModel));
 }
 
@@ -567,11 +568,13 @@ const BP_SUFFIX = { default: 'base', sm: 'sm', md: 'md', lg: 'lg', xl: 'xl' };
 let copyPayloads = [];
 let checkPayloads = [];
 let mdQueue = [];
+let relQueue = [];
 
 function resetPageDynamics() {
   copyPayloads = [];
   checkPayloads = [];
   mdQueue = [];
+  relQueue = [];
 }
 
 // A block is one node or a list (implicit stack).
@@ -669,7 +672,8 @@ function fieldNode(node, ctx, vars) {
 
   const actions = (node.actions || []).map(action => copyButton(action, raw)).join('');
   if (node.format === 'title') {
-    return `<div class="kv"${styleAttr(vars)}><div class="d-title">${value}</div></div>`;
+    const title = ctx.titleHref ? `<a href="${ctx.titleHref}">${value}</a>` : value;
+    return `<div class="kv"${styleAttr(vars)}><div class="d-title">${title}</div></div>`;
   }
   // `label: ""` suppresses the label row entirely (images, full-bleed prose).
   const label = node.label
@@ -824,7 +828,39 @@ async function fillMarkdown() {
   } catch { /* placeholders already show the raw text */ }
 }
 
-/* ---- resource + outputs nodes (record page only: need rels/outs) ---- */
+// Fill nested resource placeholders. Item blocks and expand rows render
+// without relationship data, so their resource nodes queue up here; each
+// distinct record's relationships are fetched once, then the node re-renders
+// in place. Hydrated content can queue further placeholders (and markdown),
+// so the loop drains the queue and re-runs the markdown fill as needed.
+// renderNode's depth cap bounds the recursion.
+async function fillResources() {
+  let cursor = 0;
+  while (cursor < relQueue.length) {
+    const batch = relQueue.slice(cursor);
+    const start = cursor;
+    cursor = relQueue.length;
+    const fetches = new Map();
+    for (const { ctx } of batch) {
+      const id = `${ctx.record.model}\n${ctx.record.key}`;
+      if (!fetches.has(id)) {
+        fetches.set(id, api(`/api/models/${encodeURIComponent(ctx.record.model)}/record/relationships?key=${encodeURIComponent(ctx.record.key)}`).catch(() => null));
+      }
+    }
+    const mdBefore = mdQueue.length;
+    for (let i = 0; i < batch.length; i++) {
+      const { node, ctx, vars } = batch[i];
+      const rels = await fetches.get(`${ctx.record.model}\n${ctx.record.key}`);
+      const el = document.querySelector(`[data-rel="${start + i}"]`);
+      if (!el) continue; // navigated away, or an earlier pass replaced it
+      if (!rels) { el.remove(); continue; }
+      el.outerHTML = resourceNode(node, { ...ctx, rels }, vars);
+    }
+    if (mdQueue.length > mdBefore) fillMarkdown();
+  }
+}
+
+/* ---- resource + outputs nodes (outputs on the record page only) ---- */
 
 // The related records for a resource node, from the relationships payload.
 function resourceRecords(node, ctx) {
@@ -923,7 +959,13 @@ function countNoun(n, label) {
 }
 
 function resourceNode(node, ctx, vars) {
-  if (!ctx.rels) return ''; // collection items carry no relationship data
+  if (!ctx.rels) {
+    // Items and expand rows render before their record's relationships are
+    // known; fillResources() hydrates the placeholder after the page builds.
+    if (!ctx.record) return '';
+    const index = relQueue.push({ node, ctx, vars }) - 1;
+    return `<div class="dres" data-rel="${index}"${styleAttr(vars)}></div>`;
+  }
   const related = state.project.models[node.model];
   if (!related) return '';
   const all = resourceRecords(node, ctx);
@@ -1045,21 +1087,34 @@ function imageOnlyBlock(block, model) {
     n?.type === 'field' && model.fields[n.name]?.type === 'asset');
 }
 
+// True when a block contains a resource node at any depth. Such a block
+// renders links of its own, so the item cannot be one big anchor.
+function blockHasResource(block) {
+  const walk = node => !!node && (node.type === 'resource' ||
+    (node.children || []).some(walk));
+  return blockNodes(block).some(walk);
+}
+
 // Render one record through a block (else the built-in card), linked.
 // Image-only blocks get the square gallery-tile treatment; every other block
-// keeps the regular card chrome.
+// keeps the regular card chrome. Blocks with nested resources get a plain
+// wrapper with the title linked instead of an anchor around the whole item.
 function recordItem(record, model, block, depth = 0) {
   if (!block || depth > MAX_NODE_DEPTH) return recordCard(record, model, []);
   const tile = imageOnlyBlock(block, model);
+  const nested = blockHasResource(block);
   // linkAssets false: avoid nested anchors (card → record; image link only on detail).
   // assetFill: gallery tiles should stretch the image to the cell.
   const ctx = {
     model, record, rels: null, outs: null, outboundByField: new Map(), depth,
     linkAssets: false,
     assetFill: tile,
+    titleHref: nested ? recordHref(record) : null,
   };
   const inner = blockNodes(block).map(node => renderNode(node, ctx)).join('');
-  return `<a class="item-link${tile ? ' gallery-item' : ''}" href="${recordHref(record)}">${inner}</a>`;
+  return nested
+    ? `<div class="item-card">${inner}</div>`
+    : `<a class="item-link${tile ? ' gallery-item' : ''}" href="${recordHref(record)}">${inner}</a>`;
 }
 
 function paginationHtml(view, result, q, filters) {
@@ -1161,6 +1216,7 @@ async function fetchAndRender(view, model, page, q, filters, token) {
     body.innerHTML = renderView(view, model, result) + paginationHtml(view, result, q, filters);
     wireDynamic(view, model, result);
     fillMarkdown();
+    fillResources();
   } catch (e) {
     if (t !== reqToken) return;
     body.innerHTML = `<div class="error">${esc(e.message)}</div>`;
@@ -1454,6 +1510,7 @@ function renderRecord(model, record, rels, outs, crumbs = [], activeTab = null) 
   }
   $('#page').innerHTML = `${tabsBar}<div class="detail">${inner}</div>`;
   fillMarkdown();
+  fillResources();
   wireDelete(record, title);
 }
 
