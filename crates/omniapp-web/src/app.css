@@ -108,6 +108,16 @@ tbody tr:hover { background:#f8faf8 }
 
 /* ---------- Gallery ---------- */
 .gallery { display:grid; grid-template-columns:repeat(auto-fill,minmax(215px,1fr)); gap:16px }
+/* A gallery of only image tiles packs a denser grid */
+.gallery:has(> .gallery-item) { grid-template-columns:repeat(auto-fill,minmax(160px,1fr)); gap:12px }
+/* Image-only tiles (display block with just an asset field) */
+.gallery-item { display:block; color:inherit; min-width:0; border-radius:10px; overflow:hidden;
+  border:1px solid var(--line); background:#111; aspect-ratio:1; transition:box-shadow .15s, border-color .15s }
+.gallery-item:hover { border-color:var(--accent); box-shadow:0 4px 16px #21372d18 }
+.gallery-item .dcard { border:0; box-shadow:none; background:transparent; padding:0; height:100%; border-radius:0 }
+.gallery-item .kv, .gallery-item .v { margin:0; padding:0; height:100% }
+.gallery-item .asset-tile { display:block; width:100%; height:100%; object-fit:cover; border-radius:0; margin:0; background:#111 }
+.asset-tile { display:block; max-width:100%; max-height:340px; border-radius:8px; margin-top:2px; background:#111; object-fit:cover }
 
 /* ---------- Board ---------- */
 .board { display:flex; gap:14px; overflow-x:auto; padding-bottom:8px; align-items:flex-start }
@@ -298,6 +308,9 @@ tr.expand-detail > td { padding:4px 14px 14px 40px; background:#fbfcfa }
 .filter-chip a:hover { color:var(--danger) }
 
 /* ---------- Assets ---------- */
+a.asset-full { display:inline-block; line-height:0; border-radius:8px; cursor:zoom-in; color:inherit; text-decoration:none }
+a.asset-full:hover .asset-preview,
+a.asset-full:hover .asset-thumb { outline:2px solid var(--accent); outline-offset:2px }
 .asset-thumb { display:block; width:64px; height:44px; object-fit:cover; border-radius:6px;
   border:1px solid var(--line); background:#eef1ee }
 .asset-preview { max-width:100%; max-height:340px; border-radius:8px; margin-top:2px; background:#111 }

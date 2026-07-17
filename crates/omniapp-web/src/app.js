@@ -480,9 +480,17 @@ const IMG = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'avif'];
 const VID = ['mp4', 'webm', 'mov', 'm4v', 'ogv'];
 const AUD = ['mp3', 'wav', 'ogg', 'm4a', 'flac'];
 
-function assetPreview(path, compact = false) {
+// `opts.link` (default true): wrap images in a target=_blank full-file link.
+// Set false inside linked gallery cards so we don't nest <a> in <a>.
+function assetPreview(path, compact = false, opts = {}) {
   const url = assetUrl(path), ext = String(path).split('.').pop().toLowerCase();
-  if (IMG.includes(ext)) return `<img class="${compact ? 'asset-thumb' : 'asset-preview'}" src="${esc(url)}" alt="${esc(path)}" loading="lazy">`;
+  const link = opts.link !== false;
+  if (IMG.includes(ext)) {
+    const cls = compact ? 'asset-thumb' : (opts.fill ? 'asset-tile' : 'asset-preview');
+    const img = `<img class="${cls}" src="${esc(url)}" alt="${esc(path)}" loading="lazy">`;
+    if (!link) return img;
+    return `<a class="asset-full" href="${esc(url)}" target="_blank" rel="noopener" title="Open full image">${img}</a>`;
+  }
   if (compact) return `<span class="badge plain">${VID.includes(ext) ? 'Video' : AUD.includes(ext) ? 'Audio' : 'Asset'}</span>`;
   if (VID.includes(ext)) return `<video class="asset-preview" src="${esc(url)}" controls preload="metadata"></video>`;
   if (AUD.includes(ext)) return `<audio class="asset-preview" src="${esc(url)}" controls preload="metadata"></audio>`;
@@ -696,9 +704,9 @@ function formatFieldValue(value, def, node, ctx) {
     case 'links': return linksHtml(value);
     case 'template':
       return esc(node.template || '').replace(/\{\{\s*value\s*\}\}/g, esc(String(value)));
-    case 'text': return detailValue(value, def || {}, node.name, ctx.outboundByField || new Map());
+    case 'text': return detailValue(value, def || {}, node.name, ctx.outboundByField || new Map(), ctx);
     default: // type-derived
-      return detailValue(value, def || {}, node.name, ctx.outboundByField || new Map());
+      return detailValue(value, def || {}, node.name, ctx.outboundByField || new Map(), ctx);
   }
 }
 
@@ -1027,12 +1035,31 @@ function itemBlock(view, model) {
   return model.display?.card || null;
 }
 
+// True when a block's visible content is only asset field(s) — an image
+// gallery card. One card/stack wrapper level is allowed around the fields.
+function imageOnlyBlock(block, model) {
+  let nodes = blockNodes(block);
+  if (nodes.length === 1 && ['card', 'stack'].includes(nodes[0]?.type) && nodes[0].children)
+    nodes = blockNodes(nodes[0].children);
+  return nodes.length > 0 && nodes.every(n =>
+    n?.type === 'field' && model.fields[n.name]?.type === 'asset');
+}
+
 // Render one record through a block (else the built-in card), linked.
+// Image-only blocks get the square gallery-tile treatment; every other block
+// keeps the regular card chrome.
 function recordItem(record, model, block, depth = 0) {
   if (!block || depth > MAX_NODE_DEPTH) return recordCard(record, model, []);
-  const ctx = { model, record, rels: null, outs: null, outboundByField: new Map(), depth };
+  const tile = imageOnlyBlock(block, model);
+  // linkAssets false: avoid nested anchors (card → record; image link only on detail).
+  // assetFill: gallery tiles should stretch the image to the cell.
+  const ctx = {
+    model, record, rels: null, outs: null, outboundByField: new Map(), depth,
+    linkAssets: false,
+    assetFill: tile,
+  };
   const inner = blockNodes(block).map(node => renderNode(node, ctx)).join('');
-  return `<a class="item-link" href="${recordHref(record)}">${inner}</a>`;
+  return `<a class="item-link${tile ? ' gallery-item' : ''}" href="${recordHref(record)}">${inner}</a>`;
 }
 
 function paginationHtml(view, result, q, filters) {
@@ -1488,11 +1515,15 @@ function defaultDetail(model, record, ctx) {
 }
 
 // Detail-page value formatting: richer than a table cell.
-function detailValue(value, def, name, outboundByField) {
+// Optional `ctx` carries display flags (e.g. linkAssets for nested gallery cards).
+function detailValue(value, def, name, outboundByField, ctx) {
   if (value == null || value === '') return '<span class="dash">—</span>';
   switch (def.type) {
     case 'text': return `<div class="prose">${esc(value)}</div>`;
-    case 'asset': return assetPreview(value, false);
+    case 'asset': return assetPreview(value, false, {
+      link: ctx?.linkAssets !== false,
+      fill: !!ctx?.assetFill,
+    });
     case 'boolean': return value ? 'Yes' : 'No';
     case 'json': return `<pre class="json">${esc(JSON.stringify(value, null, 2))}</pre>`;
     case 'date': case 'date_time': return esc(fmtDate(value, def.type));
