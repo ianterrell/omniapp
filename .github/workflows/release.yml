@@ -15,7 +15,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
+          # musl → fully static, runs on any Linux regardless of glibc
+          # (Cloudflare's build image is older than GitHub's runners).
+          - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
           - target: aarch64-apple-darwin
             os: macos-latest
@@ -23,6 +25,9 @@ jobs:
             os: macos-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install musl toolchain
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
