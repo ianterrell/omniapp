@@ -16,6 +16,23 @@ pub struct Page {
     pub pages: usize,
 }
 
+/// One group of a grouped list view: the resolved group value, the records
+/// kept for display (after any per-group limit), and the group's full size.
+#[derive(Debug, Clone, Serialize)]
+pub struct Group {
+    pub value: Option<Value>,
+    pub records: Vec<Record>,
+    pub total: usize,
+}
+
+/// A grouped list result: ordered groups plus the overall matching total.
+#[derive(Debug, Clone, Serialize)]
+pub struct GroupedPage {
+    pub groups: Vec<Group>,
+    pub total: usize,
+    pub grouped: bool,
+}
+
 #[must_use]
 pub fn execute_query(records: &[Record], query: &Query, page: usize) -> Page {
     execute_query_with_relations(records, records, &BTreeMap::new(), query, page)

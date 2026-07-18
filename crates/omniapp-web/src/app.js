@@ -19,7 +19,7 @@
 
 'use strict';
 
-const state = { project: null, view: null };
+const state = { project: null, view: null, recordsByModel: {} };
 let reqToken = 0;
 
 const $ = s => document.querySelector(s);
@@ -511,8 +511,40 @@ function refLink(value, field) {
   if (ref == null || value == null) return esc(value ?? '—');
   const vals = Array.isArray(value) ? value : [value];
   return vals.map(v =>
-    `<a class="ref" href="#/records/${encodeURIComponent(ref.model)}/by/${encodeURIComponent(ref.field)}/${encodeURIComponent(v)}">${esc(v)}</a>`
+    `<a class="ref" href="#/records/${encodeURIComponent(ref.model)}/by/${encodeURIComponent(ref.field)}/${encodeURIComponent(v)}">${esc(refName(v, ref))}</a>`
   ).join(', ');
+}
+
+// The human title of a referenced record (falls back to the raw key/slug when
+// the referenced records haven't been cached — see ensureRecords).
+function refName(value, ref) {
+  if (value == null) return '';
+  const records = ref && state.recordsByModel[ref.model];
+  const hit = records && records.find(r => r.values[ref.field] === value);
+  return hit ? recordTitle(hit, state.project.models[ref.model] || { fields: {} }) : String(value);
+}
+
+// Fetch and cache every record of a model, so reference cells can show titles
+// instead of slugs. Cached after the first call.
+async function ensureRecords(modelName) {
+  if (state.recordsByModel[modelName]) return;
+  try {
+    const res = await api(`/api/models/${encodeURIComponent(modelName)}/records?page_size=1000`);
+    state.recordsByModel[modelName] = res.records || [];
+  } catch {
+    state.recordsByModel[modelName] = [];
+  }
+}
+
+// Load the referenced records for every reference field a view displays, so
+// their cells render human names.
+async function ensureViewRefs(view, model) {
+  const models = new Set();
+  for (const f of viewFields(view, model)) {
+    const ref = model.fields[f]?.reference?.model;
+    if (ref) models.add(ref);
+  }
+  await Promise.all([...models].map(ensureRecords));
 }
 
 // Compact, single-line-ish value formatting for table cells & card metadata.
@@ -862,12 +894,37 @@ async function fillResources() {
 
 /* ---- resource + outputs nodes (outputs on the record page only) ---- */
 
+// Does a record satisfy one resource-node filter? Missing values read as null,
+// matching the server's filter semantics.
+function recordMatchesFilter(record, filter) {
+  const actual = record.values[filter.field];
+  const present = actual != null;
+  switch (filter.op) {
+    case 'is_null': return !present;
+    case 'is_not_null': return present;
+    case 'eq': return present && actual === filter.value;
+    case 'not_eq': return !(present && actual === filter.value);
+    case 'in': return present && Array.isArray(filter.value) && filter.value.includes(actual);
+    case 'contains':
+      if (Array.isArray(actual)) return actual.includes(filter.value);
+      return present && String(actual).includes(String(filter.value));
+    case 'lt': return present && actual < filter.value;
+    case 'lte': return present && actual <= filter.value;
+    case 'gt': return present && actual > filter.value;
+    case 'gte': return present && actual >= filter.value;
+    default: return true;
+  }
+}
+
 // The related records for a resource node, from the relationships payload.
 function resourceRecords(node, ctx) {
   const inbound = ctx.rels?.inbound || [];
   let records = inbound
     .filter(link => link.record.model === node.model && (!node.via || link.field === node.via))
     .map(link => link.record);
+  for (const filter of node.filters || []) {
+    records = records.filter(r => recordMatchesFilter(r, filter));
+  }
   for (const order of [...(node.order || [])].reverse()) {
     const dir = order.direction === 'desc' ? -1 : 1;
     records = records.slice().sort((a, b) => {
@@ -1206,14 +1263,19 @@ async function fetchAndRender(view, model, page, q, filters, token) {
     if (t !== reqToken) return;
     const count = $('#count');
     if (count) count.textContent = `${result.total} record${result.total === 1 ? '' : 's'}`;
-    if (!result.records.length) {
+    // Grouped list results carry `groups` instead of a flat `records` page.
+    const empty = result.grouped ? !result.groups.length : !result.records.length;
+    if (empty) {
       body.innerHTML = q || entries.length
         ? `<div class="empty">No records match.</div>`
         : `<div class="empty">No records yet.<br><a class="btn primary" href="#/records/${encodeURIComponent(view.model)}/new">New ${esc((model.label || model.name).toLowerCase())}</a></div>`;
       return;
     }
+    await ensureViewRefs(view, model);
+    if (t !== reqToken) return;
     resetPageDynamics();
-    body.innerHTML = renderView(view, model, result) + paginationHtml(view, result, q, filters);
+    body.innerHTML = renderView(view, model, result)
+      + (result.grouped ? '' : paginationHtml(view, result, q, filters));
     wireDynamic(view, model, result);
     fillMarkdown();
     fillResources();
@@ -1225,6 +1287,7 @@ async function fetchAndRender(view, model, page, q, filters, token) {
 
 // Dispatch to the per-type renderer. Renderers return an HTML string.
 function renderView(view, model, result) {
+  if (result.grouped) return renderGroupedList(view, model, result);
   const records = result.records;
   switch (view.type) {
     case 'board': return renderBoard(view, model, records);
@@ -1245,6 +1308,85 @@ function wireDynamic(view, model, result) {
   } else if (view.type === 'board') {
     wireBoard();
   }
+  if (result.grouped && view.check && view.sortable) wireGroupedSort();
+}
+
+// Drag-to-reorder within each group of a grouped checklist. Dropping renumbers
+// that group's visible rows (1..N) into the `data-sort` integer field.
+function wireGroupedSort() {
+  const container = $('#viewBody .grouped-checklist');
+  if (!container || !container.dataset.sort) return;
+  const modelName = container.dataset.model;
+  const field = container.dataset.sort;
+  let dragItem = null;
+
+  container.addEventListener('dragstart', e => {
+    const item = e.target.closest('.check-item');
+    if (!item) return;
+    dragItem = item;
+    item.classList.add('dragging');
+    e.dataTransfer.effectAllowed = 'move';
+    try { e.dataTransfer.setData('text/plain', item.dataset.key); } catch { /* Safari */ }
+  });
+  container.addEventListener('dragend', () => {
+    if (dragItem) dragItem.classList.remove('dragging');
+    dragItem = null;
+  });
+
+  container.querySelectorAll('.check-list.sortable').forEach(list => {
+    list.addEventListener('dragover', e => {
+      if (!dragItem || dragItem.closest('.check-list') !== list) return; // same group only
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      const after = itemAfter(list, e.clientY);
+      if (after == null) list.appendChild(dragItem);
+      else list.insertBefore(dragItem, after);
+    });
+    list.addEventListener('drop', e => {
+      if (!dragItem || dragItem.closest('.check-list') !== list) return;
+      e.preventDefault();
+      persistOrder(list, modelName, field);
+    });
+  });
+}
+
+// The row a drop at vertical position y should land before (null → append).
+function itemAfter(list, y) {
+  const items = [...list.querySelectorAll('.check-item:not(.dragging)')];
+  for (const item of items) {
+    const box = item.getBoundingClientRect();
+    if (y < box.top + box.height / 2) return item;
+  }
+  return null;
+}
+
+// Renumber a group's rows 1..N and persist the ones whose value changed.
+async function persistOrder(list, modelName, field) {
+  const items = [...list.querySelectorAll('.check-item')];
+  const changed = [];
+  items.forEach((item, i) => {
+    const next = String(i + 1);
+    if (item.dataset.sortval !== next) changed.push({ item, next });
+  });
+  if (!changed.length) return;
+  list.classList.add('saving');
+  try {
+    for (const { item, next } of changed) {
+      const saved = await api(`/api/models/${encodeURIComponent(modelName)}/record?key=${encodeURIComponent(item.dataset.key)}`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ revision: item.dataset.revision, values: { [field]: Number(next) } }),
+      });
+      item.dataset.key = saved.key;
+      item.dataset.revision = saved.revision ?? '';
+      item.dataset.sortval = next;
+    }
+    router(); // refresh so grouping/order and top-N reflect the new ranking
+  } catch (e) {
+    list.classList.remove('saving');
+    alert(e.message);
+    router();
+  }
 }
 
 function viewFields(view, model) {
@@ -1252,10 +1394,12 @@ function viewFields(view, model) {
 }
 
 /* ---- table ---- */
-function renderTable(view, model, records) {
-  const fields = viewFields(view, model);
-  const head = fields.map(f => `<th>${esc(model.fields[f]?.label || f)}</th>`).join('');
-  const rows = records.map(r => {
+function tableHead(fields, model) {
+  return fields.map(f => `<th>${esc(model.fields[f]?.label || f)}</th>`).join('');
+}
+
+function tableRows(fields, model, records) {
+  return records.map(r => {
     const cells = fields.map(f => {
       const def = model.fields[f];
       // Reference cells stay as inline links; other cells become a full-cell
@@ -1265,7 +1409,75 @@ function renderTable(view, model, records) {
     }).join('');
     return `<tr>${cells}</tr>`;
   }).join('');
-  return `<div class="table-shell"><table><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+
+function renderTable(view, model, records) {
+  const fields = viewFields(view, model);
+  return `<div class="table-shell"><table><thead><tr>${tableHead(fields, model)}</tr></thead><tbody>${tableRows(fields, model, records)}</tbody></table></div>`;
+}
+
+/* ---- grouped list (table/checklist with group_by, optional per-group limit) ---- */
+function renderGroupedList(view, model, result) {
+  const groups = result.groups || [];
+  if (!groups.length) return `<div class="empty">Nothing here yet.</div>`;
+  const noun = esc((view.group_by || 'group').split('.').pop());
+  const groupLabel = g => (g.value == null || g.value === '') ? `No ${noun}` : esc(String(g.value));
+
+  // Checklist style: big-checkbox rows (the checkbox is the only control),
+  // optionally drag-sortable to rewrite an integer field.
+  if (view.check) {
+    const sortable = !!view.sortable;
+    const sections = groups.map(g => {
+      const rows = g.records.map(r => checklistRow(r, model, view)).join('');
+      const more = g.total - g.records.length;
+      const moreNote = more > 0 ? `<div class="dres-more">and ${more} more…</div>` : '';
+      return `<section class="group">`
+        + `<div class="board-col-head"><span>${groupLabel(g)}</span><span class="n">${g.total}</span></div>`
+        + `<div class="check-list${sortable ? ' sortable' : ''}">${rows}${moreNote}</div>`
+        + `</section>`;
+    }).join('');
+    return `<div class="grouped-checklist" data-model="${esc(model.name)}"`
+      + `${sortable ? ` data-sort="${esc(view.sortable)}"` : ''}>${sections}</div>`;
+  }
+
+  // Table style (grouped rows).
+  const fields = viewFields(view, model);
+  return groups.map(g => {
+    const more = g.total - g.records.length;
+    const moreRow = more > 0
+      ? `<tr class="group-more"><td colspan="${fields.length}" class="dres-more">and ${more} more…</td></tr>`
+      : '';
+    return `<section class="group">`
+      + `<div class="board-col-head"><span>${groupLabel(g)}</span><span class="n">${g.total}</span></div>`
+      + `<div class="table-shell"><table><thead><tr>${tableHead(fields, model)}</tr></thead>`
+      + `<tbody>${tableRows(fields, model, g.records)}${moreRow}</tbody></table></div>`
+      + `</section>`;
+  }).join('');
+}
+
+// One checklist row: a big checkbox (the only interactive element — no title
+// link) plus the record's title and any non-title view fields as muted meta.
+function checklistRow(r, model, view) {
+  const done = !!r.values[view.check];
+  const index = checkPayloads.push({ record: r, field: view.check }) - 1;
+  const meta = viewFields(view, model)
+    .filter(f => f !== 'title' && f !== model.title && f !== view.check)
+    .map(f => {
+      const def = model.fields[f];
+      if (def?.type === 'reference') return esc(refName(r.values[f], def.reference));
+      const v = r.values[f];
+      return v == null || v === '' ? '' : esc(String(v));
+    })
+    .filter(Boolean)
+    .join(' · ');
+  const sortAttrs = view.sortable
+    ? ` draggable="true" data-key="${esc(r.key)}" data-revision="${esc(r.revision ?? '')}" data-sortval="${esc(r.values[view.sortable] ?? '')}"`
+    : '';
+  return `<div class="check-item${done ? ' done' : ''}"${sortAttrs}>`
+    + `<input type="checkbox" class="check-toggle big" data-check="${index}"${done ? ' checked' : ''} aria-label="Mark done">`
+    + `<span class="check-body"><span class="check-title">${esc(recordTitle(r, model))}</span>`
+    + (meta ? `<span class="check-meta">${meta}</span>` : '')
+    + `</span></div>`;
 }
 
 /* ---- board (kanban) ---- */

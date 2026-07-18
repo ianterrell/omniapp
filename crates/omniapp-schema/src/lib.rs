@@ -342,6 +342,18 @@ pub struct View {
     pub query: Query,
     #[serde(default)]
     pub group_by: Option<String>,
+    /// For grouped list views: the maximum number of records shown per group
+    /// (top-N per group). Applied after ordering, within each group.
+    #[serde(default)]
+    pub group_limit: Option<usize>,
+    /// For list views: a boolean field rendered as a checkbox toggled in place,
+    /// turning the rows into a checklist instead of a table.
+    #[serde(default)]
+    pub check: Option<String>,
+    /// For list views: an integer field rewritten when rows are drag-reordered,
+    /// letting the list act as a manual ranking.
+    #[serde(default)]
+    pub sortable: Option<String>,
     #[serde(default)]
     pub display: Option<ViewDisplay>,
 }
@@ -948,7 +960,53 @@ pub fn validate_view(view: &View, models: &BTreeMap<String, Model>) -> Vec<Probl
         check_query_field(&order.field, "query.order", &mut problems);
     }
     if let Some(group_by) = &view.group_by {
-        check_field(group_by, "group_by", &mut problems);
+        // Board and tree write the group value back to the record (drag-drop /
+        // self-reference), so they require a direct, settable field. Other view
+        // types only read the value, so they may group by a reference path.
+        match view.view_type {
+            ViewType::Board | ViewType::Tree => check_field(group_by, "group_by", &mut problems),
+            _ => check_query_field(group_by, "group_by", &mut problems),
+        }
+    }
+    if let Some(group_limit) = view.group_limit {
+        if view.group_by.is_none() {
+            problems.push(Problem::new(
+                format!("{location}.group_limit"),
+                "group_limit requires group_by",
+            ));
+        }
+        if group_limit == 0 {
+            problems.push(Problem::new(
+                format!("{location}.group_limit"),
+                "group_limit must be at least 1",
+            ));
+        }
+    }
+    if let Some(check) = &view.check {
+        match model.fields.get(check) {
+            Some(field) if field.field_type == FieldType::Boolean => {}
+            Some(_) => problems.push(Problem::new(
+                format!("{location}.check"),
+                format!(
+                    "check field {check:?} must be a boolean on model {}",
+                    model.name
+                ),
+            )),
+            None => check_field(check, "check", &mut problems),
+        }
+    }
+    if let Some(sortable) = &view.sortable {
+        match model.fields.get(sortable) {
+            Some(field) if field.field_type == FieldType::Integer => {}
+            Some(_) => problems.push(Problem::new(
+                format!("{location}.sortable"),
+                format!(
+                    "sortable field {sortable:?} must be an integer on model {}",
+                    model.name
+                ),
+            )),
+            None => check_field(sortable, "sortable", &mut problems),
+        }
     }
     if view.query.page_size == 0 || view.query.page_size > 1000 {
         problems.push(Problem::new(

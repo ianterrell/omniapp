@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{FieldType, Model, Order, Problem, View};
+use crate::{FieldType, Filter, Model, Order, Problem, View};
 
 /// Breakpoint minimum widths, shared with the admin stylesheet.
 pub const BREAKPOINTS: [(&str, u32); 5] = [
@@ -129,6 +129,10 @@ pub enum DisplayNode {
         /// For `display: checklist` — the boolean field toggled in place.
         #[serde(default)]
         check: Option<String>,
+        /// Filters applied to the related records before ordering, so a panel
+        /// can show only a subset (e.g. only `done = false`).
+        #[serde(default)]
+        filters: Vec<Filter>,
         #[serde(default)]
         order: Vec<Order>,
         #[serde(default)]
@@ -601,6 +605,7 @@ fn check_node_references(
         item,
         fields,
         check,
+        filters,
         order,
         actions,
         expand,
@@ -689,6 +694,17 @@ fn check_node_references(
                     format!(
                         "unknown order field {:?} on model {related_name}",
                         order.field
+                    ),
+                ));
+            }
+        }
+        for filter in filters {
+            if !related.fields.contains_key(&filter.field) {
+                problems.push(Problem::new(
+                    path,
+                    format!(
+                        "unknown filter field {:?} on model {related_name}",
+                        filter.field
                     ),
                 ));
             }

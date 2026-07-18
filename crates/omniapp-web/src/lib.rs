@@ -13,7 +13,7 @@ use axum::{Json, Router};
 use omniapp_core::{
     Cache, RecordInput, RecordsSnapshot, Workspace, WorkspaceError, WorkspaceWatcher,
 };
-use omniapp_schema::{Filter, Model, Query as RecordQuery};
+use omniapp_schema::{Filter, Model, Query as RecordQuery, ViewType};
 use omniapp_site::{LoadedSite, Resolution, SiteError, render_error_page};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -464,6 +464,18 @@ async fn view_records(
         .filters
         .extend(parse_filters(params.filter.as_deref(), model)?);
     let cache = Cache::open(&state.workspace.metadata_dir().join("cache.sqlite3"))?;
+    // A list view with `group_by` returns grouped buckets (with an optional
+    // per-group limit) instead of a flat page; boards still group client-side.
+    if let (ViewType::Table, Some(group_by)) = (view.view_type, view.group_by.as_deref()) {
+        return Ok(Json(serde_json::to_value(cache.query_grouped(
+            &model.name,
+            &loaded.models,
+            &query,
+            group_by,
+            view.group_limit,
+            params.q.as_deref(),
+        )?)?));
+    }
     Ok(Json(serde_json::to_value(cache.query_with_relations(
         &model.name,
         &loaded.models,

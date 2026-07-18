@@ -9,7 +9,7 @@ use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::{Page, Record};
+use crate::{Group, GroupedPage, Page, Record};
 
 #[derive(Debug, Error)]
 pub enum CacheError {
@@ -267,96 +267,8 @@ impl Cache {
     ) -> Result<Page, CacheError> {
         let page = page.max(1);
         let page_size = query.page_size.clamp(1, 1000);
-        let mut clauses = vec!["model = ?".to_owned()];
-        let mut parameters = vec![SqlValue::Text(model.to_owned())];
-
-        if let Some(needle) = search.map(str::trim).filter(|needle| !needle.is_empty()) {
-            parameters.push(SqlValue::Text(needle.to_owned()));
-            parameters.push(SqlValue::Text(needle.to_owned()));
-            clauses.push(
-                "(EXISTS (SELECT 1 FROM json_tree(records.data)
-                          WHERE json_tree.type = 'text'
-                            AND instr(lower(json_tree.value), lower(?)) > 0)
-                  OR instr(lower(record_key), lower(?)) > 0)"
-                    .to_owned(),
-            );
-        }
-
-        for filter in &query.filters {
-            let expression = match filter.op {
-                FilterOp::IsNull => {
-                    let field = field_expression(model, models, &filter.field, &mut parameters)?;
-                    format!("({field}) IS NULL")
-                }
-                FilterOp::IsNotNull => {
-                    let field = field_expression(model, models, &filter.field, &mut parameters)?;
-                    format!("({field}) IS NOT NULL")
-                }
-                FilterOp::In => {
-                    let options = filter
-                        .value
-                        .as_ref()
-                        .and_then(Value::as_array)
-                        .cloned()
-                        .unwrap_or_default();
-                    if options.is_empty() {
-                        "0".to_owned()
-                    } else {
-                        let field =
-                            field_expression(model, models, &filter.field, &mut parameters)?;
-                        let placeholders = options
-                            .into_iter()
-                            .map(|value| {
-                                parameters.push(SqlValue::Text(value.to_string()));
-                                "json_extract(?, '$')"
-                            })
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        format!("{field} IN ({placeholders})")
-                    }
-                }
-                FilterOp::Contains => {
-                    let value = filter.value.clone().unwrap_or(Value::Null).to_string();
-                    let type_field =
-                        field_expression(model, models, &filter.field, &mut parameters)?;
-                    let array_field =
-                        field_expression(model, models, &filter.field, &mut parameters)?;
-                    parameters.push(SqlValue::Text(value.clone()));
-                    let text_field =
-                        field_expression(model, models, &filter.field, &mut parameters)?;
-                    parameters.push(SqlValue::Text(value));
-                    format!(
-                        "(CASE json_type({type_field})
-                       WHEN 'array' THEN EXISTS (
-                         SELECT 1 FROM json_each({array_field})
-                         WHERE value IS json_extract(?, '$')
-                       )
-                       ELSE instr(CAST({text_field} AS TEXT), CAST(json_extract(?, '$') AS TEXT)) > 0
-                     END)"
-                    )
-                }
-                operator => {
-                    let field = field_expression(model, models, &filter.field, &mut parameters)?;
-                    parameters.push(SqlValue::Text(
-                        filter.value.clone().unwrap_or(Value::Null).to_string(),
-                    ));
-                    let operator = match operator {
-                        FilterOp::Eq => "IS",
-                        FilterOp::NotEq => "IS NOT",
-                        FilterOp::Lt => "<",
-                        FilterOp::Lte => "<=",
-                        FilterOp::Gt => ">",
-                        FilterOp::Gte => ">=",
-                        FilterOp::Contains
-                        | FilterOp::In
-                        | FilterOp::IsNull
-                        | FilterOp::IsNotNull => unreachable!(),
-                    };
-                    format!("{field} {operator} json_extract(?, '$')")
-                }
-            };
-            clauses.push(expression);
-        }
+        let mut parameters = Vec::new();
+        let clauses = build_where_clauses(model, models, query, search, &mut parameters)?;
 
         let where_clause = clauses.join(" AND ");
         let count_sql = format!("SELECT COUNT(*) FROM records WHERE {where_clause}");
@@ -366,16 +278,7 @@ impl Cache {
                     row.get(0)
                 })?;
 
-        let mut order_parts = Vec::new();
-        for order in &query.order {
-            let field = field_expression(model, models, &order.field, &mut parameters)?;
-            let direction = match order.direction {
-                Direction::Asc => "ASC",
-                Direction::Desc => "DESC",
-            };
-            order_parts.push(format!("{field} {direction}"));
-        }
-        order_parts.push("record_key ASC".to_owned());
+        let order_parts = build_order_parts(model, models, query, &mut parameters)?;
         parameters.push(SqlValue::Integer(
             i64::try_from(page_size).unwrap_or(i64::MAX),
         ));
@@ -399,6 +302,84 @@ impl Cache {
             page_size,
             total,
             pages: total.div_ceil(page_size),
+        })
+    }
+
+    /// Run a declarative query and bucket the matches by `group_by` (which may
+    /// be a dotted reference path), preserving the order the records appear in.
+    /// Each group keeps at most `group_limit` records; the group's full size is
+    /// reported separately so callers can show an overflow note.
+    pub fn query_grouped(
+        &self,
+        model: &str,
+        models: &BTreeMap<String, Model>,
+        query: &Query,
+        group_by: &str,
+        group_limit: Option<usize>,
+        search: Option<&str>,
+    ) -> Result<GroupedPage, CacheError> {
+        let models = Some(models);
+        // Parameters are bound positionally, so they must be pushed in the
+        // order the placeholders appear in the SQL text: SELECT (group value),
+        // then WHERE, then ORDER BY.
+        let mut parameters = Vec::new();
+        let group_expr = field_expression(model, models, group_by, &mut parameters)?;
+        let clauses = build_where_clauses(model, models, query, search, &mut parameters)?;
+        let where_clause = clauses.join(" AND ");
+        let order_parts = build_order_parts(model, models, query, &mut parameters)?;
+        // Grouping needs every match so per-group limits are correct; cap at the
+        // query engine's ceiling rather than paginating.
+        let select_sql = format!(
+            "SELECT model, record_key, path, revision, data, ({group_expr}) AS group_value
+             FROM records
+             WHERE {where_clause}
+             ORDER BY {}
+             LIMIT 1000",
+            order_parts.join(", ")
+        );
+        let mut statement = self.connection.prepare(&select_sql)?;
+        let rows = statement
+            .query_map(params_from_iter(parameters), |row| {
+                Ok((record_from_row(row)?, group_value_from_row(row)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let total = rows.len();
+        let mut order: Vec<Option<Value>> = Vec::new();
+        let mut buckets: HashMap<String, (Vec<Record>, usize)> = HashMap::new();
+        for (record, value) in rows {
+            let bucket_key = match &value {
+                Some(value) => value.to_string(),
+                None => "\u{0}none".to_owned(),
+            };
+            let entry = buckets.entry(bucket_key).or_insert_with(|| {
+                order.push(value.clone());
+                (Vec::new(), 0)
+            });
+            entry.1 += 1;
+            if group_limit.is_none_or(|limit| entry.0.len() < limit) {
+                entry.0.push(record);
+            }
+        }
+        let groups = order
+            .into_iter()
+            .map(|value| {
+                let bucket_key = match &value {
+                    Some(value) => value.to_string(),
+                    None => "\u{0}none".to_owned(),
+                };
+                let (records, total) = buckets.remove(&bucket_key).unwrap_or_default();
+                Group {
+                    value,
+                    records,
+                    total,
+                }
+            })
+            .collect();
+        Ok(GroupedPage {
+            groups,
+            total,
+            grouped: true,
         })
     }
 
@@ -501,6 +482,135 @@ fn record_from_row(row: &Row<'_>) -> rusqlite::Result<Record> {
 
 fn json_path(field: &str) -> String {
     format!("$.\"{}\"", field.replace('"', "\\\""))
+}
+
+/// Build the WHERE clause fragments (model, optional search, filters) shared by
+/// the paginated and grouped query paths, pushing bound parameters in order.
+fn build_where_clauses(
+    model: &str,
+    models: Option<&BTreeMap<String, Model>>,
+    query: &Query,
+    search: Option<&str>,
+    parameters: &mut Vec<SqlValue>,
+) -> Result<Vec<String>, CacheError> {
+    let mut clauses = vec!["model = ?".to_owned()];
+    parameters.push(SqlValue::Text(model.to_owned()));
+
+    if let Some(needle) = search.map(str::trim).filter(|needle| !needle.is_empty()) {
+        parameters.push(SqlValue::Text(needle.to_owned()));
+        parameters.push(SqlValue::Text(needle.to_owned()));
+        clauses.push(
+            "(EXISTS (SELECT 1 FROM json_tree(records.data)
+                      WHERE json_tree.type = 'text'
+                        AND instr(lower(json_tree.value), lower(?)) > 0)
+              OR instr(lower(record_key), lower(?)) > 0)"
+                .to_owned(),
+        );
+    }
+
+    for filter in &query.filters {
+        let expression = match filter.op {
+            FilterOp::IsNull => {
+                let field = field_expression(model, models, &filter.field, parameters)?;
+                format!("({field}) IS NULL")
+            }
+            FilterOp::IsNotNull => {
+                let field = field_expression(model, models, &filter.field, parameters)?;
+                format!("({field}) IS NOT NULL")
+            }
+            FilterOp::In => {
+                let options = filter
+                    .value
+                    .as_ref()
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                if options.is_empty() {
+                    "0".to_owned()
+                } else {
+                    let field = field_expression(model, models, &filter.field, parameters)?;
+                    let placeholders = options
+                        .into_iter()
+                        .map(|value| {
+                            parameters.push(SqlValue::Text(value.to_string()));
+                            "json_extract(?, '$')"
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("{field} IN ({placeholders})")
+                }
+            }
+            FilterOp::Contains => {
+                let value = filter.value.clone().unwrap_or(Value::Null).to_string();
+                let type_field = field_expression(model, models, &filter.field, parameters)?;
+                let array_field = field_expression(model, models, &filter.field, parameters)?;
+                parameters.push(SqlValue::Text(value.clone()));
+                let text_field = field_expression(model, models, &filter.field, parameters)?;
+                parameters.push(SqlValue::Text(value));
+                format!(
+                    "(CASE json_type({type_field})
+                   WHEN 'array' THEN EXISTS (
+                     SELECT 1 FROM json_each({array_field})
+                     WHERE value IS json_extract(?, '$')
+                   )
+                   ELSE instr(CAST({text_field} AS TEXT), CAST(json_extract(?, '$') AS TEXT)) > 0
+                 END)"
+                )
+            }
+            operator => {
+                let field = field_expression(model, models, &filter.field, parameters)?;
+                parameters.push(SqlValue::Text(
+                    filter.value.clone().unwrap_or(Value::Null).to_string(),
+                ));
+                let operator = match operator {
+                    FilterOp::Eq => "IS",
+                    FilterOp::NotEq => "IS NOT",
+                    FilterOp::Lt => "<",
+                    FilterOp::Lte => "<=",
+                    FilterOp::Gt => ">",
+                    FilterOp::Gte => ">=",
+                    FilterOp::Contains | FilterOp::In | FilterOp::IsNull | FilterOp::IsNotNull => {
+                        unreachable!()
+                    }
+                };
+                format!("{field} {operator} json_extract(?, '$')")
+            }
+        };
+        clauses.push(expression);
+    }
+    Ok(clauses)
+}
+
+/// Build the ORDER BY fragments (query order plus a stable key tiebreak),
+/// pushing bound parameters in order.
+fn build_order_parts(
+    model: &str,
+    models: Option<&BTreeMap<String, Model>>,
+    query: &Query,
+    parameters: &mut Vec<SqlValue>,
+) -> Result<Vec<String>, CacheError> {
+    let mut order_parts = Vec::new();
+    for order in &query.order {
+        let field = field_expression(model, models, &order.field, parameters)?;
+        let direction = match order.direction {
+            Direction::Asc => "ASC",
+            Direction::Desc => "DESC",
+        };
+        order_parts.push(format!("{field} {direction}"));
+    }
+    order_parts.push("record_key ASC".to_owned());
+    Ok(order_parts)
+}
+
+/// Read the trailing `group_value` column of a grouped query row into JSON.
+fn group_value_from_row(row: &Row<'_>) -> rusqlite::Result<Option<Value>> {
+    let value: SqlValue = row.get(5)?;
+    Ok(match value {
+        SqlValue::Integer(number) => Some(Value::from(number)),
+        SqlValue::Real(number) => Some(Value::from(number)),
+        SqlValue::Text(text) => Some(Value::from(text)),
+        SqlValue::Null | SqlValue::Blob(_) => None,
+    })
 }
 
 fn field_expression(
@@ -735,6 +845,137 @@ fields:
                 .collect::<Vec<_>>(),
             vec!["active-todo", "general-todo"]
         );
+    }
+
+    #[test]
+    fn grouped_query_buckets_by_reference_path_with_per_group_limit() {
+        let directory = tempdir().unwrap();
+        let mut cache = Cache::open(&directory.path().join("cache.sqlite3")).unwrap();
+        cache
+            .rebuild(&[
+                typed_record(
+                    "t1",
+                    "Todo",
+                    json!({"done": false, "priority": 1, "project": "quick"}),
+                ),
+                typed_record(
+                    "t2",
+                    "Todo",
+                    json!({"done": false, "priority": 2, "project": "quick"}),
+                ),
+                typed_record(
+                    "t3",
+                    "Todo",
+                    json!({"done": false, "priority": 3, "project": "quick"}),
+                ),
+                typed_record(
+                    "t4",
+                    "Todo",
+                    json!({"done": false, "priority": 1, "project": "snack"}),
+                ),
+                typed_record(
+                    "gone",
+                    "Todo",
+                    json!({"done": true, "priority": 1, "project": "quick"}),
+                ),
+                typed_record("quick", "Project", json!({"slug": "quick", "brand": "q"})),
+                typed_record("snack", "Project", json!({"slug": "snack", "brand": "s"})),
+                typed_record("q", "Brand", json!({"slug": "q", "name": "Quickies"})),
+                typed_record("s", "Brand", json!({"slug": "s", "name": "Snacks"})),
+            ])
+            .unwrap();
+        let todo_model: Model = serde_yaml::from_str(
+            r#"
+version: 1
+name: Todo
+storage: { kind: file, path: "todos/{id}.md" }
+fields:
+  id: { type: string, source: { kind: path, variable: id } }
+  done: { type: boolean, source: { kind: frontmatter, key: done } }
+  priority: { type: integer, source: { kind: frontmatter, key: priority } }
+  project:
+    type: reference
+    source: { kind: frontmatter, key: project }
+    reference: { model: Project, field: slug }
+"#,
+        )
+        .unwrap();
+        let project_model: Model = serde_yaml::from_str(
+            r#"
+version: 1
+name: Project
+storage: { kind: file, path: "projects/{slug}.md" }
+fields:
+  slug: { type: string, source: { kind: path, variable: slug } }
+  brand:
+    type: reference
+    source: { kind: frontmatter, key: brand }
+    reference: { model: Brand, field: slug }
+"#,
+        )
+        .unwrap();
+        let brand_model: Model = serde_yaml::from_str(
+            r#"
+version: 1
+name: Brand
+storage: { kind: file, path: "brands/{slug}.md" }
+fields:
+  slug: { type: string, source: { kind: path, variable: slug } }
+  name: { type: string, source: { kind: frontmatter, key: name } }
+"#,
+        )
+        .unwrap();
+        let models = BTreeMap::from([
+            ("Todo".to_owned(), todo_model),
+            ("Project".to_owned(), project_model),
+            ("Brand".to_owned(), brand_model),
+        ]);
+        let query = Query {
+            filters: vec![Filter {
+                field: "done".into(),
+                op: FilterOp::NotEq,
+                value: Some(json!(true)),
+            }],
+            order: vec![
+                Order {
+                    field: "project.brand.name".into(),
+                    direction: Direction::Asc,
+                },
+                Order {
+                    field: "priority".into(),
+                    direction: Direction::Asc,
+                },
+            ],
+            page_size: 100,
+        };
+        let grouped = cache
+            .query_grouped("Todo", &models, &query, "project.brand.name", Some(2), None)
+            .unwrap();
+
+        // The done todo is filtered out; groups are labeled by the resolved
+        // brand name and ordered by it.
+        assert_eq!(grouped.total, 4);
+        let labels: Vec<&str> = grouped
+            .groups
+            .iter()
+            .map(|group| group.value.as_ref().and_then(Value::as_str).unwrap())
+            .collect();
+        assert_eq!(labels, vec!["Quickies", "Snacks"]);
+
+        // Quickies has three active todos but only the top two are kept.
+        let quickies = &grouped.groups[0];
+        assert_eq!(quickies.total, 3);
+        assert_eq!(
+            quickies
+                .records
+                .iter()
+                .map(|record| record.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["t1", "t2"]
+        );
+        let snacks = &grouped.groups[1];
+        assert_eq!(snacks.total, 1);
+        assert_eq!(snacks.records.len(), 1);
     }
 
     #[test]
