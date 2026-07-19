@@ -193,10 +193,24 @@ Each view type has a dedicated renderer in the admin application:
 - `table`: sortable columns from `fields`; reference cells link to the referenced record's page. Setting `group_by` (which may be a dotted reference path such as `project.brand.name`) turns the table into a grouped list: rows are bucketed under a header per resolved value, in the order the query produces them. `group_limit` then caps how many rows each group shows (top-N per group), with an "and N more…" note for the remainder.
 - `board`: kanban columns from the `group_by` field's enum choices (plus a trailing column for records without a value, and appended columns for unexpected values). Cards are draggable between columns; dropping a card writes the destination column's value to the record's `group_by` field (the trailing column clears it).
 - `cards`: a card grid; each record renders through its display block (see Display below), falling back to a built-in card whose image is the first `asset` field.
-- `calendar`: a month grid keyed on the first date-typed `query.order` field (else the first date-typed view field); undated records collect in a strip below.
-- `timeline`: a chronological list with date markers, in query order.
+- `calendar`: a paper-style month grid, opened to the current month. By default it uses the first date-typed `query.order` field (else the first date-typed view field). `calendar.date_fields` may instead list fallbacks in priority order; the first populated valid field wins per record. Date-time values use the browser's local date and time, while date-only values stay on their literal date. `calendar.color_by` plus `calendar.colors` assigns item colors from raw field values (`default` is the optional fallback), and `calendar.dim_past` reduces the emphasis of elapsed items. Undated records collect in a strip below. Set `agenda: true` to append a chronological list grouped by date, from today forward.
+- `timeline`: a chronological list with date markers, in query order. Timeline items honor the view's configured item display block.
 - `tree`: threaded indentation using `group_by` naming a self-reference field (for example a comment's `parent`).
 - `form`: a full-page create form for the model.
+
+```yaml
+type: calendar
+agenda: true
+calendar:
+  date_fields: [sent_at, scheduled_at]
+  color_by: channel
+  colors:
+    bluesky: "#1185fe"
+    twitter: "#111111"
+    linkedin: "#7c3aed"
+    default: "#68736e"
+  dim_past: true
+```
 
 Rows and cards navigate to a full record page — a formatted read view laid out by the model's `detail` display block (see Display below), or by a default stacked field grid with the record's relationships as tabs and an edit button.
 
@@ -209,7 +223,7 @@ When serving, the admin application runs on its own port at `/`; each public sit
 Models control how the admin presents their records through named **display blocks** under `display:`. A block is a tree of layout nodes (or a list of nodes, rendered as an implicit vertical stack). Two names are special:
 
 - `detail` lays out the record page.
-- `card` is the default block used wherever records render as items — `cards` views, board columns, related-record tabs, and `resource` nodes on other models' pages. A view can pick a different block with `display: { item: <name> }`; a `resource` node with `item: <name>`.
+- `card` is the default block used wherever records render as items — `cards` views, board columns, calendar cells, timelines, related-record tabs, and `resource` nodes on other models' pages. A view can pick a different block with `display: { item: <name> }`; a `resource` node with `item: <name>`. A calendar with `agenda: true` may independently select the lower list's block with `display: { agenda: <name> }` (falling back to `item`, then `card`).
 
 ```yaml
 # .omniapp/models/book.yml

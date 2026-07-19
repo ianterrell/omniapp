@@ -88,7 +88,7 @@ docs/
   project-format.md
 ```
 
-The current implementation deliberately does not execute project scripts yet, load `sqlite-vec`, or render specialized board/calendar/tree layouts. Their boundaries and sequencing are documented in [the architecture plan](docs/architecture.md).
+The current implementation does not execute project scripts yet or load `sqlite-vec`. Their boundaries and sequencing are documented in [the architecture plan](docs/architecture.md).
 
 [`examples/markdown-records`](examples/markdown-records) is a working project showing both single-file Markdown records and directory records whose body/frontmatter document is named `content.md`.
 

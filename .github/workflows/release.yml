@@ -35,9 +35,13 @@ jobs:
         run: cargo build --release --locked -p omniapp-cli --target ${{ matrix.target }}
       - name: Package
         run: |
-          tar -C "target/${{ matrix.target }}/release" -czf \
-            "omniapp-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" omniapp
+          versioned_archive="omniapp-${{ github.ref_name }}-${{ matrix.target }}.tar.gz"
+          latest_archive="omniapp-latest-${{ matrix.target }}.tar.gz"
+          tar -C "target/${{ matrix.target }}/release" -czf "$versioned_archive" omniapp
+          cp "$versioned_archive" "$latest_archive"
       - name: Attach to release
         uses: softprops/action-gh-release@v2
         with:
-          files: omniapp-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+          files: |
+            omniapp-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+            omniapp-latest-${{ matrix.target }}.tar.gz

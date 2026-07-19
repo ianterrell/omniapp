@@ -354,8 +354,33 @@ pub struct View {
     /// letting the list act as a manual ranking.
     #[serde(default)]
     pub sortable: Option<String>,
+    /// For calendar views: append an agenda grouped by local date, showing
+    /// records from today forward in chronological order.
+    #[serde(default)]
+    pub agenda: bool,
+    /// Calendar-only date selection and visual treatment.
+    #[serde(default)]
+    pub calendar: Option<CalendarOptions>,
     #[serde(default)]
     pub display: Option<ViewDisplay>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CalendarOptions {
+    /// First non-empty date/date-time field wins for each record. When empty,
+    /// the calendar keeps its query-order/view-field heuristic.
+    #[serde(default)]
+    pub date_fields: Vec<String>,
+    /// Direct model field whose raw value selects an entry from `colors`.
+    #[serde(default)]
+    pub color_by: Option<String>,
+    /// Raw field value to six-digit hex color. `default` is the fallback.
+    #[serde(default)]
+    pub colors: BTreeMap<String, String>,
+    /// Render items before now with reduced emphasis.
+    #[serde(default)]
+    pub dim_past: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1008,22 +1033,67 @@ pub fn validate_view(view: &View, models: &BTreeMap<String, Model>) -> Vec<Probl
             None => check_field(sortable, "sortable", &mut problems),
         }
     }
+    if view.agenda && view.view_type != ViewType::Calendar {
+        problems.push(Problem::new(
+            format!("{location}.agenda"),
+            "agenda is only supported on calendar views",
+        ));
+    }
+    if let Some(calendar) = &view.calendar {
+        if view.view_type != ViewType::Calendar {
+            problems.push(Problem::new(
+                format!("{location}.calendar"),
+                "calendar configuration is only supported on calendar views",
+            ));
+        }
+        for field in &calendar.date_fields {
+            match model.fields.get(field) {
+                Some(definition)
+                    if matches!(definition.field_type, FieldType::Date | FieldType::DateTime) => {}
+                Some(_) => problems.push(Problem::new(
+                    format!("{location}.calendar.date_fields"),
+                    format!(
+                        "date field {field:?} must be a date or date_time on model {}",
+                        model.name
+                    ),
+                )),
+                None => check_field(field, "calendar.date_fields", &mut problems),
+            }
+        }
+        if let Some(color_by) = &calendar.color_by {
+            check_field(color_by, "calendar.color_by", &mut problems);
+        } else if !calendar.colors.is_empty() {
+            problems.push(Problem::new(
+                format!("{location}.calendar.colors"),
+                "calendar colors require color_by",
+            ));
+        }
+        for (value, color) in &calendar.colors {
+            if !is_hex_color(color) {
+                problems.push(Problem::new(
+                    format!("{location}.calendar.colors.{value}"),
+                    format!("{color:?} must be a 6-digit hex color like \"#245c47\""),
+                ));
+            }
+        }
+    }
     if view.query.page_size == 0 || view.query.page_size > 1000 {
         problems.push(Problem::new(
             format!("{location}.query.page_size"),
             "must be between 1 and 1000",
         ));
     }
-    if let Some(item) = view
-        .display
-        .as_ref()
-        .and_then(|display| display.item.as_ref())
-        && !model.display.contains_key(item)
-    {
-        problems.push(Problem::new(
-            format!("{location}.display.item"),
-            format!("model {} has no display block {item:?}", model.name),
-        ));
+    if let Some(display) = &view.display {
+        for (slot, block) in [("item", &display.item), ("agenda", &display.agenda)] {
+            if let Some(block) = block
+                && !model.display.contains_key(block)
+            {
+                problems.push(Problem::new(
+                    format!("{location}.display.{slot}"),
+                    format!("model {} has no display block {block:?}", model.name),
+                ));
+            }
+        }
     }
     problems
 }
@@ -1293,6 +1363,86 @@ query:
             validate_view(&invalid, &models)
                 .iter()
                 .any(|problem| { problem.message.contains("is not a reference") })
+        );
+    }
+
+    #[test]
+    fn validates_calendar_agenda_and_display_blocks() {
+        let event: Model = serde_yaml::from_str(
+            r#"
+version: 1
+name: Event
+storage: { kind: file, path: "events/{id}.md" }
+fields:
+  id: { type: string, source: { kind: path, variable: id } }
+  starts_at: { type: date_time, source: { kind: frontmatter, key: starts_at } }
+display:
+  compact: { type: field, name: id, label: "" }
+  detailed: { type: field, name: starts_at }
+"#,
+        )
+        .unwrap();
+        let models = BTreeMap::from([("Event".to_owned(), event)]);
+        let valid: View = serde_yaml::from_str(
+            r##"
+version: 1
+name: events
+model: Event
+type: calendar
+fields: [starts_at]
+agenda: true
+calendar:
+  date_fields: [starts_at]
+  color_by: id
+  colors: { launch: "#1185fe", default: "#68736e" }
+  dim_past: true
+display: { item: compact, agenda: detailed }
+query: { page_size: 50 }
+"##,
+        )
+        .unwrap();
+        assert_eq!(validate_view(&valid, &models), Vec::new());
+
+        let invalid: View = serde_yaml::from_str(
+            r"
+version: 1
+name: invalid
+model: Event
+type: table
+agenda: true
+calendar:
+  date_fields: [id, missing]
+  colors: { launch: red }
+display: { agenda: missing }
+query: { page_size: 50 }
+",
+        )
+        .unwrap();
+        let problems = validate_view(&invalid, &models);
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.message.contains("only supported on calendar"))
+        );
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.message.contains("must be a date or date_time"))
+        );
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.message.contains("calendar colors require color_by"))
+        );
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.message.contains("6-digit hex color"))
+        );
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.message.contains("no display block"))
         );
     }
 

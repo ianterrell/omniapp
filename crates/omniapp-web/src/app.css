@@ -155,22 +155,63 @@ tbody tr:hover { background:#f8faf8 }
 .board-col.drag-over .board-empty { border-color:var(--accent) }
 
 /* ---------- Calendar ---------- */
+.cal-paper { min-width:0 }
 .cal-head { display:flex; align-items:center; gap:12px; margin-bottom:12px }
-.cal-head h2 { margin:0; font:600 19px ui-serif,Georgia,serif }
+.cal-head h2 { margin:0; font:600 21px ui-serif,Georgia,serif }
 .cal-nav { display:flex; gap:6px; margin-left:auto }
-.cal-nav button { width:34px; height:34px; border:1px solid var(--line); background:var(--panel); border-radius:8px }
+.cal-nav button { min-width:34px; height:34px; padding:0 10px; border:1px solid var(--line);
+  background:var(--panel); border-radius:8px; color:var(--ink) }
+.cal-nav button:hover { border-color:#c3ccc7; background:#fafbf9 }
 .cal-grid { display:grid; grid-template-columns:repeat(7,1fr); gap:1px; background:var(--line);
-  border:1px solid var(--line); border-radius:11px; overflow:hidden }
+  border:1px solid var(--line); border-radius:11px; overflow:hidden; box-shadow:0 2px 12px #21372d0a }
 .cal-dow { background:#fafbf9; color:var(--muted); text-align:center; font-size:11px;
   text-transform:uppercase; letter-spacing:.06em; padding:8px 0 }
-.cal-cell { background:var(--panel); min-height:96px; padding:6px 7px }
-.cal-cell.blank { background:#fbfcfb }
-.cal-date { color:var(--muted); font-size:12px; margin-bottom:4px }
-.cal-cell.today .cal-date { color:var(--accent); font-weight:700 }
-.cal-ev { display:block; background:var(--accent-soft); color:var(--accent); border-radius:6px;
-  padding:2px 6px; font-size:12px; margin-bottom:3px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
-.undated { margin-top:18px }
-.undated h3 { font-size:13px; color:var(--muted); margin:0 0 9px }
+.cal-cell { background:var(--panel); min-height:126px; padding:7px; min-width:0 }
+.cal-cell.outside { background:#f8faf8 }
+.cal-cell.outside > :not(.cal-date) { opacity:.66 }
+.cal-date { color:var(--muted); font-size:12px; margin-bottom:5px; width:24px; height:24px;
+  display:grid; place-items:center; border-radius:99px }
+.cal-cell.outside .cal-date { color:#aeb6b1 }
+.cal-cell.today { box-shadow:inset 0 0 0 2px var(--accent) }
+.cal-cell.today .cal-date { color:#fff; background:var(--accent); font-weight:700 }
+.cal-ev { --cal-color:var(--accent); display:block; min-width:0; background:var(--accent-soft);
+  background:color-mix(in srgb,var(--cal-color) 14%,white); color:var(--cal-color);
+  border-left:3px solid var(--cal-color); border-radius:6px; padding:5px 6px; font-size:12px;
+  margin-bottom:4px; overflow:hidden }
+.cal-ev.past { opacity:.66 }
+a.cal-ev:hover, .cal-ev:has(.item-link:hover) { filter:brightness(.97) }
+.cal-ev-time { display:block; font-size:10px; line-height:1.2; font-weight:750; letter-spacing:.02em;
+  margin-bottom:2px; white-space:nowrap }
+.cal-ev-title { display:block; line-height:1.25; overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+.cal-ev .item-link { color:inherit }
+.cal-ev .dstack { gap:3px }
+.cal-ev .kv .k { margin-bottom:1px }
+.cal-ev .kv .v { line-height:1.25; display:-webkit-box; -webkit-line-clamp:2;
+  -webkit-box-orient:vertical; overflow:hidden }
+.cal-ev .badge { padding:1px 6px; font-size:10px; background:#ffffff99; color:var(--cal-color) }
+.undated { margin-top:34px }
+.undated > h2 { margin:0 0 12px; font:600 19px ui-serif,Georgia,serif }
+
+/* ---------- Calendar agenda ---------- */
+.agenda { margin-top:38px; max-width:980px }
+.agenda-head { display:flex; align-items:baseline; justify-content:space-between; margin-bottom:12px }
+.agenda-head h2 { margin:0; font:600 21px ui-serif,Georgia,serif }
+.agenda-day { margin-bottom:24px }
+.agenda-day:last-child { margin-bottom:0 }
+.agenda-day > h3 { margin:0 0 8px; font-size:13px; color:var(--muted); font-weight:700 }
+.agenda-rows { background:var(--panel); border:1px solid var(--line); border-radius:11px;
+  overflow:hidden; box-shadow:0 1px 6px #21372d08 }
+.agenda-row { --cal-color:transparent; display:grid; grid-template-columns:104px minmax(0,1fr);
+  border-left:3px solid var(--cal-color); border-bottom:1px solid #edf0ee }
+.agenda-row:last-child { border-bottom:0 }
+.agenda-row.past { opacity:.66 }
+.agenda-time { padding:17px 14px; color:var(--muted); font-size:12px; font-weight:650;
+  text-align:right; white-space:nowrap }
+.agenda-item { min-width:0; padding:9px 10px 9px 0 }
+.agenda-item .dcard { border:0; box-shadow:none; padding:8px 10px; background:transparent }
+.agenda-item .item-link:hover .dcard { background:#f8faf8; box-shadow:none }
+.agenda-item .prose { color:var(--ink) }
+.agenda-empty { border:1px solid var(--line); border-radius:11px; background:var(--panel); padding:30px 20px }
 
 /* ---------- Timeline ---------- */
 .timeline { display:flex; flex-direction:column; gap:0; position:relative }
@@ -271,6 +312,10 @@ pre.json { background:#fafbf9; border:1px solid var(--line); border-radius:8px; 
 .check-row a:hover { color:var(--accent) }
 .check-row.done a { text-decoration:line-through; color:#9aa39f }
 .check-row input { accent-color:var(--accent); width:22px; height:22px; flex:0 0 auto; cursor:pointer }
+.check-sortable.saving { opacity:.55; pointer-events:none }
+.check-sortable .check-row { cursor:grab }
+.check-sortable .check-row.dragging { opacity:.4; background:var(--accent-soft) }
+.check-sortable .check-row input, .check-sortable .check-row a { cursor:pointer }
 .table-shell.mini table { white-space:normal }
 .table-shell.mini td.plain { padding:11px 15px }
 .item-link { display:block; color:inherit; min-width:0 }
@@ -372,4 +417,10 @@ input:focus,textarea:focus,select:focus { outline:3px solid var(--accent-soft); 
   header { flex-direction:column; gap:12px; min-height:0 }
   .actions { width:100% }
   .tl-row { grid-template-columns:92px minmax(0,1fr); gap:12px }
+  .cal-paper { overflow-x:auto; padding-bottom:5px }
+  .cal-head { position:sticky; left:0; min-width:min(100%,720px) }
+  .cal-grid { min-width:720px }
+  .agenda-row { grid-template-columns:78px minmax(0,1fr) }
+  .agenda-time { padding:16px 9px; font-size:11px }
+  .agenda-item { padding-right:6px }
 }

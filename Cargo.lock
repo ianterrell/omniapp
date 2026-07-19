@@ -812,7 +812,7 @@ dependencies = [
 
 [[package]]
 name = "omniapp-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -831,7 +831,7 @@ dependencies = [
 
 [[package]]
 name = "omniapp-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "notify",
@@ -850,7 +850,7 @@ dependencies = [
 
 [[package]]
 name = "omniapp-schema"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "regex",
  "serde",
@@ -861,7 +861,7 @@ dependencies = [
 
 [[package]]
 name = "omniapp-site"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "minijinja",
@@ -878,7 +878,7 @@ dependencies = [
 
 [[package]]
 name = "omniapp-web"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "axum",
  "omniapp-core",

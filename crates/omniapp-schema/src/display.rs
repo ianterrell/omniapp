@@ -37,6 +37,10 @@ impl DisplayBlock {
 }
 
 /// One node in a display block's layout tree.
+// Resource nodes intentionally keep their complete query and rendering config
+// together; this AST is configuration data, so boxing the public variant would
+// add API complexity without improving a hot path.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DisplayNode {
@@ -129,6 +133,11 @@ pub enum DisplayNode {
         /// For `display: checklist` — the boolean field toggled in place.
         #[serde(default)]
         check: Option<String>,
+        /// For `display: checklist` — an integer field made drag-reorderable;
+        /// dropping renumbers the visible rows 1..N into this field. Order by
+        /// it so the manual ranking is what shows.
+        #[serde(default)]
+        sortable: Option<String>,
         /// Filters applied to the related records before ordering, so a panel
         /// can show only a subset (e.g. only `done = false`).
         #[serde(default)]
@@ -374,13 +383,15 @@ pub enum OutputsDisplay {
     List,
 }
 
-/// Display configuration on a view: which block renders each record in list
-/// contexts (default: the model's `card` block, else the built-in card).
+/// Display configuration on a view: which blocks render records in the
+/// primary item context and, for calendar views, the optional agenda.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ViewDisplay {
     #[serde(default)]
     pub item: Option<String>,
+    #[serde(default)]
+    pub agenda: Option<String>,
 }
 
 /// Pseudo-fields addressable alongside model fields in `field` nodes.
@@ -505,6 +516,7 @@ fn validate_node(
             display,
             item,
             check,
+            sortable,
             expand,
             tree,
             ..
@@ -519,6 +531,9 @@ fn validate_node(
             }
             if !matches!(display, ResourceDisplay::Checklist) && check.is_some() {
                 problems.push(Problem::new(path, "check is only valid for checklist"));
+            }
+            if !matches!(display, ResourceDisplay::Checklist) && sortable.is_some() {
+                problems.push(Problem::new(path, "sortable is only valid for checklist"));
             }
             if !matches!(display, ResourceDisplay::Item) && item.is_some() {
                 problems.push(Problem::new(path, "item is only valid for display: item"));
@@ -605,6 +620,7 @@ fn check_node_references(
         item,
         fields,
         check,
+        sortable,
         filters,
         order,
         actions,
@@ -676,6 +692,17 @@ fn check_node_references(
             problems.push(Problem::new(
                 path,
                 format!("check field {check:?} must be a boolean on {related_name}"),
+            ));
+        }
+        if let Some(sortable) = sortable
+            && related
+                .fields
+                .get(sortable)
+                .is_none_or(|field| field.field_type != FieldType::Integer)
+        {
+            problems.push(Problem::new(
+                path,
+                format!("sortable field {sortable:?} must be an integer on {related_name}"),
             ));
         }
         for field in fields {

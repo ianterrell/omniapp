@@ -689,9 +689,13 @@ function fieldNode(node, ctx, vars) {
   let value;
   if (node.format === 'badge' || node.format === 'badges') {
     const badges = names
-      .map(n => n.startsWith('meta.') ? metaValue(ctx.record, n) : ctx.record.values[n])
-      .filter(v => !isEmpty(v))
-      .flatMap(v => Array.isArray(v) ? v : [v])
+      .flatMap(n => {
+        const rawValue = n.startsWith('meta.') ? metaValue(ctx.record, n) : ctx.record.values[n];
+        if (isEmpty(rawValue)) return [];
+        const field = ctx.model.fields[n];
+        return (Array.isArray(rawValue) ? rawValue : [rawValue]).map(v =>
+          field?.type === 'reference' ? refName(v, field.reference) : v);
+      })
       .map(v => `<span class="badge plain">${esc(v)}</span>`)
       .join('');
     value = badges ? `<span class="badge-row">${badges}</span>` : null;
@@ -890,6 +894,7 @@ async function fillResources() {
     }
     if (mdQueue.length > mdBefore) fillMarkdown();
   }
+  wireResourceSort();
 }
 
 /* ---- resource + outputs nodes (outputs on the record page only) ---- */
@@ -1038,13 +1043,23 @@ function resourceNode(node, ctx, vars) {
   } else if (!all.length) {
     body = `<div class="d-summary dash">${esc(node.empty ?? 'None yet.')}</div>`;
   } else if (display === 'checklist') {
-    body = records.map(r => {
+    // `sortable` names an integer field made drag-reorderable; rows become
+    // draggable divs (a label would swallow drags) that renumber on drop.
+    const sortField = node.sortable;
+    const rows = records.map(r => {
       const done = !!r.values[node.check];
       const index = checkPayloads.push({ record: r, field: node.check }) - 1;
-      return `<label class="check-row${done ? ' done' : ''}">` +
+      const drag = sortField
+        ? ` draggable="true" data-key="${esc(r.key)}" data-revision="${esc(r.revision ?? '')}" data-sortval="${esc(r.values[sortField] ?? '')}"`
+        : '';
+      const tag = sortField ? 'div' : 'label';
+      return `<${tag} class="check-row${sortField ? ' check-item' : ''}${done ? ' done' : ''}"${drag}>` +
         `<input type="checkbox" class="check-toggle" data-check="${index}"${done ? ' checked' : ''}>` +
-        `<a href="${recordHref(r)}">${esc(recordTitle(r, related))}</a></label>`;
+        `<a href="${recordHref(r)}"${sortField ? ' draggable="false"' : ''}>${esc(recordTitle(r, related))}</a></${tag}>`;
     }).join('');
+    body = sortField
+      ? `<div class="check-sortable" data-model="${esc(node.model)}" data-sort="${esc(sortField)}">${rows}</div>`
+      : rows;
   } else if (display === 'table' || display === 'tree') {
     const columns = node.fields && node.fields.length
       ? node.fields.map(c => typeof c === 'string' ? { field: c } : c)
@@ -1132,6 +1147,14 @@ function itemBlock(view, model) {
   const name = view?.display?.item;
   if (name && model.display?.[name]) return model.display[name];
   return model.display?.card || null;
+}
+
+// A calendar's lower agenda may use a roomier block than its compact day
+// cells. It falls back through the regular item selection.
+function agendaBlock(view, model) {
+  const name = view?.display?.agenda;
+  if (name && model.display?.[name]) return model.display[name];
+  return itemBlock(view, model);
 }
 
 // True when a block's visible content is only asset field(s) — an image
@@ -1311,42 +1334,56 @@ function wireDynamic(view, model, result) {
   if (result.grouped && view.check && view.sortable) wireGroupedSort();
 }
 
-// Drag-to-reorder within each group of a grouped checklist. Dropping renumbers
-// that group's visible rows (1..N) into the `data-sort` integer field.
-function wireGroupedSort() {
-  const container = $('#viewBody .grouped-checklist');
-  if (!container || !container.dataset.sort) return;
-  const modelName = container.dataset.model;
-  const field = container.dataset.sort;
+// Drag-to-reorder one list of `.check-item` rows: dropping renumbers the
+// visible rows (1..N) into `field` via PUT (see persistOrder). Dragging is
+// scoped to a single list — `dragItem` lives in this closure, so a drag begun
+// in one list is invisible to any other, which keeps grouped lists independent.
+function wireSortableList(list, modelName, field) {
   let dragItem = null;
-
-  container.addEventListener('dragstart', e => {
+  list.addEventListener('dragstart', e => {
     const item = e.target.closest('.check-item');
-    if (!item) return;
+    if (!item || item.parentElement !== list) return;
     dragItem = item;
     item.classList.add('dragging');
     e.dataTransfer.effectAllowed = 'move';
     try { e.dataTransfer.setData('text/plain', item.dataset.key); } catch { /* Safari */ }
   });
-  container.addEventListener('dragend', () => {
+  list.addEventListener('dragend', () => {
     if (dragItem) dragItem.classList.remove('dragging');
     dragItem = null;
   });
+  list.addEventListener('dragover', e => {
+    if (!dragItem) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    const after = itemAfter(list, e.clientY);
+    if (after == null) list.appendChild(dragItem);
+    else list.insertBefore(dragItem, after);
+  });
+  list.addEventListener('drop', e => {
+    if (!dragItem) return;
+    e.preventDefault();
+    persistOrder(list, modelName, field);
+  });
+}
 
-  container.querySelectorAll('.check-list.sortable').forEach(list => {
-    list.addEventListener('dragover', e => {
-      if (!dragItem || dragItem.closest('.check-list') !== list) return; // same group only
-      e.preventDefault();
-      e.dataTransfer.dropEffect = 'move';
-      const after = itemAfter(list, e.clientY);
-      if (after == null) list.appendChild(dragItem);
-      else list.insertBefore(dragItem, after);
-    });
-    list.addEventListener('drop', e => {
-      if (!dragItem || dragItem.closest('.check-list') !== list) return;
-      e.preventDefault();
-      persistOrder(list, modelName, field);
-    });
+// Grouped checklist views: each group is its own sortable list (drag within a
+// group only), all rewriting the same integer field.
+function wireGroupedSort() {
+  const container = $('#viewBody .grouped-checklist');
+  if (!container || !container.dataset.sort) return;
+  container.querySelectorAll('.check-list.sortable').forEach(list =>
+    wireSortableList(list, container.dataset.model, container.dataset.sort));
+}
+
+// Resource-block checklists on a record detail page hydrate after the page
+// builds (see fillResources), so wire them once their rows exist. Idempotent:
+// a re-render or a repeated fillResources pass skips already-wired lists.
+function wireResourceSort() {
+  document.querySelectorAll('.dres .check-sortable').forEach(list => {
+    if (list.dataset.wired) return;
+    list.dataset.wired = '1';
+    wireSortableList(list, list.dataset.model, list.dataset.sort);
   });
 }
 
@@ -1622,64 +1659,206 @@ function calendarDateField(view, model) {
   return null;
 }
 
+// Calendar views may name multiple date fields. The first non-empty, valid
+// value wins per record (for example sent_at before scheduled_at). Without an
+// explicit list, preserve the original query-order/view-field heuristic.
+function calendarDateFields(view, model) {
+  const configured = view.calendar?.date_fields || [];
+  if (configured.length) return configured;
+  const inferred = calendarDateField(view, model);
+  return inferred ? [inferred] : [];
+}
+
+function localDateKey(date) {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+}
+
+// Date-only fields are calendar literals and must not move under timezone
+// conversion. Date-time fields are placed on the browser's local day.
+function calendarDate(value, type) {
+  if (value == null || value === '') return null;
+  const raw = String(value);
+  if (type === 'date') {
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(raw.slice(0, 10));
+    if (match) {
+      const date = new Date(+match[1], +match[2] - 1, +match[3]);
+      return { date, key: match[0] };
+    }
+  }
+  const date = new Date(value);
+  return isNaN(date) ? null : { date, key: localDateKey(date) };
+}
+
+function clockLabel(date, type) {
+  if (type !== 'date_time') return 'All day';
+  return date.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+}
+
+function calendarRecordDate(view, model, record) {
+  for (const field of calendarDateFields(view, model)) {
+    const raw = record.values[field];
+    const type = model.fields[field]?.type;
+    const parsed = calendarDate(raw, type);
+    if (parsed) return { r: record, field, raw, type, ...parsed };
+  }
+  return null;
+}
+
+function calendarItemStyle(view, record) {
+  const field = view.calendar?.color_by;
+  if (!field) return '';
+  const palette = view.calendar?.colors || {};
+  const raw = record.values[field];
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  const color = palette[String(value ?? '')] || palette.default;
+  return color ? ` style="--cal-color:${esc(color)}"` : '';
+}
+
+function calendarItemPast(view, entry) {
+  if (!view.calendar?.dim_past) return false;
+  if (entry.type === 'date') return entry.key < localDateKey(new Date());
+  return entry.date.getTime() < Date.now();
+}
+
+function calendarEvent(view, model, block, entry) {
+  const time = entry.type === 'date_time'
+    ? `<span class="cal-ev-time">${esc(clockLabel(entry.date, entry.type))}</span>`
+    : '';
+  const past = calendarItemPast(view, entry) ? ' past' : '';
+  const style = calendarItemStyle(view, entry.r);
+  if (block) {
+    return `<div class="cal-ev${past}"${style} title="${esc(recordTitle(entry.r, model))}">${time}${recordItem(entry.r, model, block)}</div>`;
+  }
+  return `<a class="cal-ev${past}"${style} href="${recordHref(entry.r)}" title="${esc(recordTitle(entry.r, model))}">` +
+    `${time}<span class="cal-ev-title">${esc(recordTitle(entry.r, model))}</span></a>`;
+}
+
 function renderCalendar(mount, view, model, records) {
-  const field = calendarDateField(view, model);
   const dated = [], undated = [];
   for (const r of records) {
-    const raw = field && r.values[field];
-    const key = raw && String(raw).slice(0, 10); // YYYY-MM-DD prefix, no tz math
-    if (key && /^\d{4}-\d{2}-\d{2}$/.test(key)) dated.push({ r, key });
+    const entry = calendarRecordDate(view, model, r);
+    if (entry) dated.push(entry);
     else undated.push(r);
   }
   const byDay = new Map();
-  for (const d of dated) (byDay.get(d.key) || byDay.set(d.key, []).get(d.key)).push(d.r);
+  for (const d of dated) (byDay.get(d.key) || byDay.set(d.key, []).get(d.key)).push(d);
 
-  const first = dated.length ? dated[0].key : new Date().toISOString().slice(0, 10);
-  let year = +first.slice(0, 4), month = +first.slice(5, 7) - 1;
+  // Calendar navigation always starts where the user is, even when the first
+  // query result lives in a past or future month.
+  const today = new Date();
+  const todayKey = localDateKey(today);
+  let year = today.getFullYear(), month = today.getMonth();
+  const block = itemBlock(view, model);
+  const agendaHtml = view.agenda ? renderAgenda(view, model, dated, todayKey) : '';
+  const undatedHtml = undated.length
+    ? `<section class="undated"><h2>Undated</h2><div class="gallery">${undated.map(r => block ? recordItem(r, model, block) : recordCard(r, model, viewFields(view, model))).join('')}</div></section>`
+    : '';
+
+  mount.innerHTML =
+    `<section class="cal-paper"><div class="cal-head"><h2 id="calMonth"></h2>` +
+    `<div class="cal-nav"><button id="calToday" type="button">Today</button>` +
+    `<button id="calPrev" type="button" aria-label="Previous month">‹</button>` +
+    `<button id="calNext" type="button" aria-label="Next month">›</button></div></div>` +
+    `<div class="cal-grid" id="calGrid"></div></section>${agendaHtml}${undatedHtml}`;
 
   const draw = () => {
     const monthName = new Date(year, month, 1).toLocaleDateString(undefined, { month: 'long', year: 'numeric' });
     const firstDow = new Date(year, month, 1).getDay();
     const days = new Date(year, month + 1, 0).getDate();
-    const todayKey = new Date().toISOString().slice(0, 10);
     const dow = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map(d => `<div class="cal-dow">${d}</div>`).join('');
+    // At least five complete weeks, with adjacent-month dates visible like a
+    // printed wall calendar instead of leaving dead blank cells.
+    const cellCount = Math.max(35, Math.ceil((firstDow + days) / 7) * 7);
+    const start = new Date(year, month, 1 - firstDow);
     let cells = '';
-    for (let i = 0; i < firstDow; i++) cells += '<div class="cal-cell blank"></div>';
-    for (let day = 1; day <= days; day++) {
-      const key = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
-      const evs = (byDay.get(key) || []).map(r =>
-        `<a class="cal-ev" href="${recordHref(r)}" title="${esc(recordTitle(r, model))}">${esc(recordTitle(r, model))}</a>`).join('');
-      cells += `<div class="cal-cell${key === todayKey ? ' today' : ''}"><div class="cal-date">${day}</div>${evs}</div>`;
+    for (let i = 0; i < cellCount; i++) {
+      const date = new Date(start.getFullYear(), start.getMonth(), start.getDate() + i);
+      const key = localDateKey(date);
+      const outside = date.getMonth() !== month;
+      const events = (byDay.get(key) || []).map(entry =>
+        calendarEvent(view, model, block, entry)).join('');
+      cells += `<div class="cal-cell${outside ? ' outside' : ''}${key === todayKey ? ' today' : ''}">` +
+        `<div class="cal-date">${date.getDate()}</div>${events}</div>`;
     }
-    const block = itemBlock(view, model);
-    const undatedHtml = undated.length
-      ? `<div class="undated"><h3>Undated</h3><div class="gallery">${undated.map(r => block ? recordItem(r, model, block) : recordCard(r, model, viewFields(view, model))).join('')}</div></div>`
-      : '';
-    mount.innerHTML =
-      `<div class="cal-head"><h2>${esc(monthName)}</h2><div class="cal-nav"><button id="calPrev" aria-label="Previous month">‹</button><button id="calNext" aria-label="Next month">›</button></div></div>` +
-      `<div class="cal-grid">${dow}${cells}</div>${undatedHtml}`;
-    mount.querySelector('#calPrev').onclick = () => { month--; if (month < 0) { month = 11; year--; } draw(); };
-    mount.querySelector('#calNext').onclick = () => { month++; if (month > 11) { month = 0; year++; } draw(); };
+    mount.querySelector('#calMonth').textContent = monthName;
+    mount.querySelector('#calGrid').innerHTML = dow + cells;
+  };
+
+  mount.querySelector('#calToday').onclick = () => {
+    const now = new Date(); year = now.getFullYear(); month = now.getMonth(); draw(); fillMarkdown();
+  };
+  mount.querySelector('#calPrev').onclick = () => {
+    month--; if (month < 0) { month = 11; year--; } draw(); fillMarkdown();
+  };
+  mount.querySelector('#calNext').onclick = () => {
+    month++; if (month > 11) { month = 0; year++; } draw(); fillMarkdown();
   };
   draw();
+}
+
+// A calendar agenda is deliberately grouped by local day and starts at the
+// beginning of today. This keeps all of today's schedule visible even after a
+// time slot has passed, while excluding stale scheduled records from prior days.
+function renderAgenda(view, model, dated, todayKey) {
+  const groups = new Map();
+  for (const entry of dated) {
+    if (entry.key < todayKey) continue;
+    (groups.get(entry.key) || groups.set(entry.key, []).get(entry.key)).push(entry);
+  }
+  const keys = [...groups.keys()].sort();
+  if (!keys.length) {
+    return `<section class="agenda"><div class="agenda-head"><h2>Upcoming</h2></div>` +
+      `<div class="empty agenda-empty">Nothing scheduled from today forward.</div></section>`;
+  }
+  const block = agendaBlock(view, model);
+  const today = new Date();
+  const tomorrow = new Date(today.getFullYear(), today.getMonth(), today.getDate() + 1);
+  const tomorrowKey = localDateKey(tomorrow);
+  const sections = keys.map(key => {
+    const [y, m, d] = key.split('-').map(Number);
+    const date = new Date(y, m - 1, d);
+    const prefix = key === todayKey ? 'Today · ' : key === tomorrowKey ? 'Tomorrow · ' : '';
+    const label = prefix + date.toLocaleDateString(undefined, {
+      weekday: 'long', month: 'long', day: 'numeric',
+    });
+    const entries = groups.get(key).slice().sort((a, b) => a.date - b.date);
+    const rows = entries.map(entry => {
+      const item = block
+        ? recordItem(entry.r, model, block)
+        : `<a class="card" href="${recordHref(entry.r)}"><div class="card-title">${esc(recordTitle(entry.r, model))}</div>` +
+          `<div class="card-meta">${secondaryMeta(entry.r, model, view, entry.field)}</div></a>`;
+      const past = calendarItemPast(view, entry) ? ' past' : '';
+      return `<div class="agenda-row${past}"${calendarItemStyle(view, entry.r)}>` +
+        `<time class="agenda-time" datetime="${esc(entry.raw)}">${esc(clockLabel(entry.date, entry.type))}</time>` +
+        `<div class="agenda-item">${item}</div></div>`;
+    }).join('');
+    return `<section class="agenda-day"><h3>${esc(label)}</h3><div class="agenda-rows">${rows}</div></section>`;
+  }).join('');
+  return `<section class="agenda"><div class="agenda-head"><h2>Upcoming</h2></div>${sections}</section>`;
 }
 
 /* ---- timeline ---- */
 function renderTimeline(view, model, records) {
   const field = calendarDateField(view, model);
+  const type = model.fields[field]?.type;
   const dated = [], undated = [];
   for (const r of records) {
     const raw = field && r.values[field];
-    if (raw && !isNaN(new Date(raw))) dated.push(r); else undated.push(r);
+    const parsed = calendarDate(raw, type);
+    if (parsed) dated.push({ r, ...parsed }); else undated.push(r);
   }
+  const block = itemBlock(view, model);
+  const item = r => block
+    ? recordItem(r, model, block)
+    : `<a class="card" href="${recordHref(r)}"><div class="card-title">${esc(recordTitle(r, model))}</div>` +
+      `<div class="card-meta">${secondaryMeta(r, model, view, field)}</div></a>`;
   const row = (r, dateHtml) =>
     `<div class="tl-row"><div class="tl-date">${dateHtml}</div>` +
-    `<div class="tl-body"><a class="card" href="${recordHref(r)}"><div class="card-title">${esc(recordTitle(r, model))}</div>` +
-    `<div class="card-meta">${secondaryMeta(r, model, view, field)}</div></a></div></div>`;
-  const rows = dated.map(r => {
-    const d = new Date(r.values[field]);
-    const dt = `<span class="d">${d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}</span>${d.getFullYear()}`;
-    return row(r, dt);
+    `<div class="tl-body">${item(r)}</div></div>`;
+  const rows = dated.map(entry => {
+    const dt = `<span class="d">${entry.date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}</span>` +
+      `${entry.date.getFullYear()}${type === 'date_time' ? `<br>${esc(clockLabel(entry.date, type))}` : ''}`;
+    return row(entry.r, dt);
   }).join('');
   const tail = undated.map(r => row(r, '<span class="d">Undated</span>')).join('');
   return `<div class="timeline">${rows}${tail}</div>`;
