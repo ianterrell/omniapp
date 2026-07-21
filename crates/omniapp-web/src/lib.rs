@@ -318,6 +318,9 @@ async fn site_page(State(state): State<SiteState>, request: Request) -> Response
     }
     match site.resolve(&path) {
         Ok(Resolution::Html(html)) => Html(html).into_response(),
+        Ok(Resolution::Raw { content_type, body }) => {
+            ([(header::CONTENT_TYPE, content_type)], body).into_response()
+        }
         Ok(Resolution::Redirect(to)) => Redirect::temporary(&to).into_response(),
         Ok(Resolution::NotFound { html }) => (
             StatusCode::NOT_FOUND,

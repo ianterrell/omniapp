@@ -267,6 +267,56 @@ fn resolve_exact_redirect_and_not_found() {
 }
 
 #[test]
+fn raw_pages_keep_their_filename_and_content_type() {
+    let dir = blog();
+    let root = dir.path();
+    write(
+        root,
+        ".omniapp/sites/main/pages/robots.txt",
+        "User-agent: *\nSitemap: {{ site.url | safe }}/sitemap.xml\n",
+    );
+    write(
+        root,
+        ".omniapp/sites/main/pages/sitemap.xml",
+        "<urlset>{% for post in records.Post %}<loc>{{ post.url | safe }}</loc>{% endfor %}</urlset>\n",
+    );
+
+    let workspace = Workspace::new(root);
+    let report = single_report(build(&workspace, &BuildOptions::default()).unwrap());
+    assert!(
+        report.errors.is_empty(),
+        "unexpected errors: {:?}",
+        report.errors
+    );
+    let out = root.join("_site/main");
+    // Verbatim filenames at the site root — no pretty-URL directory wrapping.
+    let robots = read(root, "_site/main/robots.txt");
+    assert!(robots.contains("Sitemap: "), "rendered: {robots}");
+    assert!(
+        !robots.contains("&#x2f;"),
+        "raw pages must not be HTML-escaped: {robots}"
+    );
+    assert!(!out.join("robots/index.html").exists());
+    let sitemap = read(root, "_site/main/sitemap.xml");
+    assert!(sitemap.contains("<loc>/posts/hello/</loc>"), "{sitemap}");
+
+    let site = LoadedSite::load(&workspace, "main").unwrap();
+    match site.resolve("/robots.txt").unwrap() {
+        Resolution::Raw { content_type, body } => {
+            assert_eq!(content_type, "text/plain; charset=utf-8");
+            assert!(body.contains("User-agent"));
+        }
+        other => panic!("expected raw, got {other:?}"),
+    }
+    match site.resolve("/sitemap.xml").unwrap() {
+        Resolution::Raw { content_type, .. } => {
+            assert_eq!(content_type, "application/xml; charset=utf-8");
+        }
+        other => panic!("expected raw, got {other:?}"),
+    }
+}
+
+#[test]
 fn missing_site_has_no_site() {
     let dir = tempdir().unwrap();
     write(

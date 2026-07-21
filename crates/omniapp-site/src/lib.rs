@@ -14,7 +14,7 @@ mod render;
 mod routes;
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -71,10 +71,31 @@ pub struct BuildReport {
 pub enum Resolution {
     /// A rendered page.
     Html(String),
+    /// A rendered non-HTML page (`sitemap.xml`, `llms.txt`, …) and the
+    /// content type it should be served with.
+    Raw {
+        content_type: &'static str,
+        body: String,
+    },
     /// The URL should redirect to a canonical (slash-terminated) form.
     Redirect(String),
     /// No page matched; `html` is the rendered 404 page if one exists.
     NotFound { html: Option<String> },
+}
+
+/// The serve content type for a non-HTML output file, by extension. `None`
+/// means the route is an ordinary HTML page.
+fn raw_content_type(output: &Path) -> Option<&'static str> {
+    let extension = output.extension()?.to_str()?.to_ascii_lowercase();
+    match extension.as_str() {
+        "html" | "htm" => None,
+        "xml" => Some("application/xml; charset=utf-8"),
+        "json" | "webmanifest" => Some("application/json; charset=utf-8"),
+        "svg" => Some("image/svg+xml"),
+        "css" => Some("text/css; charset=utf-8"),
+        "js" => Some("text/javascript; charset=utf-8"),
+        _ => Some("text/plain; charset=utf-8"),
+    }
 }
 
 #[derive(Debug, Error)]
@@ -234,7 +255,11 @@ impl LoadedSite {
         }
         let normalized = normalize_url(url_path);
         if let Some(route) = self.routes.iter().find(|route| route.url == normalized) {
-            return Ok(Resolution::Html(self.render_route(route)?));
+            let body = self.render_route(route)?;
+            return Ok(match raw_content_type(&route.output) {
+                Some(content_type) => Resolution::Raw { content_type, body },
+                None => Resolution::Html(body),
+            });
         }
         if !normalized.ends_with('/') {
             let slashed = format!("{normalized}/");

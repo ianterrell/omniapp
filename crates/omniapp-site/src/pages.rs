@@ -356,8 +356,30 @@ fn deserialize_key<T: serde::de::DeserializeOwned>(
     }
 }
 
-/// Map a page path to its pretty URL and output file path.
+/// Map a page path to its pretty URL and output file path. Only `.html` and
+/// `.md` pages get pretty directory URLs; any other extension is a raw page
+/// (`sitemap.xml`, `llms.txt`, `robots.txt`, …) whose URL and output keep the
+/// path under `pages/` verbatim — still Jinja-rendered, never layout-derived.
 fn derive_route(rel_under_pages: &Path) -> (String, PathBuf) {
+    let pretty = rel_under_pages
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("html")
+                || extension.eq_ignore_ascii_case("htm")
+                || extension.eq_ignore_ascii_case("md")
+        });
+    if !pretty {
+        let joined = rel_under_pages
+            .components()
+            .filter_map(|component| match component {
+                std::path::Component::Normal(value) => Some(value.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("/");
+        return (format!("/{joined}"), PathBuf::from(joined));
+    }
     let mut stem = rel_under_pages.to_path_buf();
     stem.set_extension("");
     let mut base: Vec<String> = stem

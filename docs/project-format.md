@@ -298,7 +298,7 @@ A project can publish any number of fully user-styled public sites from the same
   site.yml          # optional site configuration
   layouts/*.html    # base templates ({% extends "layouts/base.html" %})
   includes/*.html   # partials ({% include "includes/post-card.html" %})
-  pages/**          # URL-mapped pages (.html and .md)
+  pages/**          # URL-mapped pages (.html, .md, and raw files)
   assets/**         # static files, served and copied verbatim under /assets/
 ```
 
@@ -308,7 +308,7 @@ A project can publish any number of fully user-styled public sites from the same
 
 ### Pages
 
-`pages/index.html` maps to `/`; every other page gets a pretty URL: `pages/about.md` becomes `/about/`, `pages/docs/setup.md` becomes `/docs/setup/`. `pages/404.html` is rendered as the not-found page. Pages may begin with a `---` YAML frontmatter block. Unlike `.omniapp` definitions, page frontmatter allows unknown keys — they are user space, exposed to the template as `page.<key>`. Recognized keys: `title`, `permalink` (overrides the derived URL), `layout` (wraps the rendered page in `layouts/<name>.html`, which receives it as `content`), and the generator keys below. `.md` pages are Jinja-rendered, converted from Markdown, then wrapped by their layout; `.html` pages normally use `{% extends %}` instead of `layout`.
+`pages/index.html` maps to `/`; every other `.html`/`.md` page gets a pretty URL: `pages/about.md` becomes `/about/`, `pages/docs/setup.md` becomes `/docs/setup/`. A page with any other extension is a **raw page**: it is still Jinja-rendered (with frontmatter honored) but keeps its path verbatim as both URL and output file, is not wrapped in a layout unless frontmatter asks for one, auto-escapes by its own extension (`.xml` keeps XML-safe escaping; `.txt` and friends render unescaped), and is served with a content type matching its extension — `pages/sitemap.xml` becomes `/sitemap.xml` (`application/xml`), `pages/llms.txt` becomes `/llms.txt` (`text/plain`). `pages/404.html` is rendered as the not-found page. Pages may begin with a `---` YAML frontmatter block. Unlike `.omniapp` definitions, page frontmatter allows unknown keys — they are user space, exposed to the template as `page.<key>`. Recognized keys: `title`, `permalink` (overrides the derived URL), `layout` (wraps the rendered page in `layouts/<name>.html`, which receives it as `content`), and the generator keys below. `.md` pages are Jinja-rendered, converted from Markdown, then wrapped by their layout; `.html` pages normally use `{% extends %}` instead of `layout`.
 
 A page that declares a record source becomes a generator, producing one page per record:
 
